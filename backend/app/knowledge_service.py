@@ -1,0 +1,1051 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+
+DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
+DATABASE_PATH = DATA_DIRECTORY / "exam_booster.db"
+EMBEDDING_CACHE_PATH = DATA_DIRECTORY / "embedding_cache.db"
+EMBEDDING_CONFIG_KEY = "embedding_config"
+DEFAULT_EMBEDDING_CONFIG: dict[str, Any] = {
+    "enabled": True,
+    "provider": "ollama",
+    "baseUrl": "http://127.0.0.1:11434",
+    "model": "bge-m3",
+}
+_EMBEDDING_UNAVAILABLE_UNTIL = 0.0
+_OLLAMA_START_LOCK = threading.Lock()
+_LOCAL_OLLAMA_PROCESS: subprocess.Popen | None = None
+_LOCAL_OLLAMA_EXECUTABLE = Path(
+    os.environ.get("EXAM_BOOSTER_OLLAMA_EXECUTABLE", r"D:\AI\Ollama\ollama.exe")
+)
+_LOCAL_OLLAMA_MODELS = Path(
+    os.environ.get("OLLAMA_MODELS", r"D:\AI\Models\text\ollama")
+)
+_LOCAL_OLLAMA_LOG_DIRECTORY = _LOCAL_OLLAMA_EXECUTABLE.parent / "logs"
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _database_connection() -> sqlite3.Connection:
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _embedding_connection() -> sqlite3.Connection:
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(EMBEDDING_CACHE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_knowledge_database() -> None:
+    with _database_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_materials (
+                course_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                character_count INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (course_id, relative_path)
+            );
+
+            CREATE TABLE IF NOT EXISTS material_chunks (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                material_name TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                locator TEXT NOT NULL,
+                heading TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_material_chunks_course
+                ON material_chunks (course_id, relative_path, chunk_index);
+
+            CREATE TABLE IF NOT EXISTS chat_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT UNIQUE,
+                course_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sources_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_turns_course
+                ON chat_turns (course_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                knowledge_point_id TEXT NOT NULL DEFAULT '',
+                question_id TEXT NOT NULL DEFAULT '',
+                is_correct INTEGER,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_learning_events_course
+                ON learning_events (course_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS learner_memories (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                knowledge_point_id TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                source_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_learner_memories_course
+                ON learner_memories (course_id, status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS memory_evidence (
+                memory_id TEXT NOT NULL,
+                evidence_type TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (memory_id, evidence_type, evidence_id),
+                FOREIGN KEY (memory_id) REFERENCES learner_memories(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS review_sections (
+                course_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                section_index INTEGER NOT NULL,
+                section_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (course_id, task_id, section_index)
+            );
+            """
+        )
+        try:
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS material_chunks_fts
+                USING fts5(chunk_id UNINDEXED, course_id UNINDEXED, content, tokenize='unicode61')
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    with _embedding_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                chunk_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, model)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model
+                ON chunk_embeddings (model);
+            """
+        )
+
+
+def _read_embedding_config() -> dict[str, Any]:
+    initialize_knowledge_database()
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM app_metadata WHERE key = ?",
+            (EMBEDDING_CONFIG_KEY,),
+        ).fetchone()
+    if row is None:
+        return dict(DEFAULT_EMBEDDING_CONFIG)
+    try:
+        saved = json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        saved = {}
+    return {**DEFAULT_EMBEDDING_CONFIG, **saved}
+
+
+def save_embedding_config(payload: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(payload.get("baseUrl") or payload.get("base_url") or "").strip().rstrip("/")
+    parsed_url = urlparse(base_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        raise ValueError("Embedding Base URL 必须是合法的 HTTP 或 HTTPS 地址")
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        raise ValueError("请填写 Embedding 模型名")
+    config = {
+        "enabled": bool(payload.get("enabled", True)),
+        "provider": "ollama",
+        "baseUrl": base_url,
+        "model": model,
+    }
+    initialize_knowledge_database()
+    with _database_connection() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)",
+            (EMBEDDING_CONFIG_KEY, json.dumps(config, ensure_ascii=False)),
+        )
+    return get_embedding_status(probe=False)
+
+
+def _perform_ollama_request(
+    config: dict[str, Any],
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    url = f"{str(config['baseUrl']).rstrip('/')}{path}"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"} if body is not None else {},
+        method="POST" if body is not None else "GET",
+    )
+    with urlopen(request, timeout=None) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _is_local_ollama_config(config: dict[str, Any]) -> bool:
+    parsed_url = urlparse(str(config.get("baseUrl", "")))
+    return parsed_url.scheme == "http" and parsed_url.hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _start_local_ollama_service(config: dict[str, Any], *, wait: bool) -> bool:
+    global _LOCAL_OLLAMA_PROCESS
+
+    if not config.get("enabled") or not _is_local_ollama_config(config):
+        return False
+    if not _LOCAL_OLLAMA_EXECUTABLE.is_file():
+        return False
+
+    with _OLLAMA_START_LOCK:
+        try:
+            _perform_ollama_request(config, "/api/tags")
+            return True
+        except (URLError, TimeoutError, OSError):
+            pass
+
+        process = _LOCAL_OLLAMA_PROCESS
+        if process is None or process.poll() is not None:
+            _LOCAL_OLLAMA_LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+            environment = os.environ.copy()
+            environment["OLLAMA_HOST"] = str(urlparse(str(config["baseUrl"])).netloc)
+            environment["OLLAMA_MODELS"] = str(_LOCAL_OLLAMA_MODELS)
+            environment["OLLAMA_NO_CLOUD"] = "true"
+            creation_flags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_NO_WINDOW
+                | subprocess.DETACHED_PROCESS
+            )
+            stdout_path = _LOCAL_OLLAMA_LOG_DIRECTORY / "server.stdout.log"
+            stderr_path = _LOCAL_OLLAMA_LOG_DIRECTORY / "server.stderr.log"
+            with stdout_path.open("ab") as stdout_log, stderr_path.open("ab") as stderr_log:
+                process = subprocess.Popen(
+                    [str(_LOCAL_OLLAMA_EXECUTABLE), "serve"],
+                    cwd=str(_LOCAL_OLLAMA_EXECUTABLE.parent),
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_log,
+                    stderr=stderr_log,
+                    creationflags=creation_flags,
+                    close_fds=True,
+                )
+            _LOCAL_OLLAMA_PROCESS = process
+
+        if not wait:
+            return True
+
+        while True:
+            try:
+                _perform_ollama_request(config, "/api/tags")
+                return True
+            except (URLError, TimeoutError, OSError):
+                if process.poll() is not None:
+                    raise RuntimeError(f"Ollama 启动失败，进程退出码为 {process.returncode}")
+                time.sleep(0.25)
+
+
+def ensure_local_ollama_service() -> bool:
+    return _start_local_ollama_service(_read_embedding_config(), wait=False)
+
+
+def _ollama_request(path: str, payload: dict[str, Any] | None = None) -> Any:
+    config = _read_embedding_config()
+    try:
+        return _perform_ollama_request(config, path, payload)
+    except (URLError, TimeoutError, OSError):
+        if not _start_local_ollama_service(config, wait=True):
+            raise
+        return _perform_ollama_request(config, path, payload)
+
+
+def _request_embeddings(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    config = _read_embedding_config()
+    if not config.get("enabled"):
+        raise RuntimeError("Embedding 已关闭")
+    try:
+        data = _ollama_request(
+            "/api/embed",
+            {"model": config["model"], "input": texts},
+        )
+        embeddings = data.get("embeddings") if isinstance(data, dict) else None
+        if isinstance(embeddings, list) and len(embeddings) == len(texts):
+            return [[float(value) for value in vector] for vector in embeddings]
+    except HTTPError as error:
+        if error.code != 404:
+            raise
+
+    vectors: list[list[float]] = []
+    for text in texts:
+        data = _ollama_request(
+            "/api/embeddings",
+            {"model": config["model"], "prompt": text},
+        )
+        vector = data.get("embedding") if isinstance(data, dict) else None
+        if not isinstance(vector, list) or not vector:
+            raise RuntimeError("Embedding 服务没有返回向量")
+        vectors.append([float(value) for value in vector])
+    return vectors
+
+
+def _embedding_counts(model: str) -> tuple[int, int, int]:
+    with _database_connection() as connection:
+        total = int(connection.execute("SELECT COUNT(*) FROM material_chunks").fetchone()[0])
+    with _embedding_connection() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*), COALESCE(MAX(dimension), 0) FROM chunk_embeddings WHERE model = ?",
+            (model,),
+        ).fetchone()
+    return int(row[0]), total, int(row[1])
+
+
+def get_embedding_status(*, probe: bool = True) -> dict[str, Any]:
+    config = _read_embedding_config()
+    indexed, total, dimension = _embedding_counts(str(config["model"]))
+    result = {
+        **config,
+        "status": "disabled" if not config.get("enabled") else "unavailable",
+        "message": "Embedding 已关闭，当前使用关键词检索。" if not config.get("enabled") else "尚未检测服务。",
+        "indexedChunks": indexed,
+        "totalChunks": total,
+        "dimension": dimension,
+    }
+    if not config.get("enabled") or not probe:
+        return result
+    try:
+        data = _ollama_request("/api/tags")
+        names = [str(item.get("name", "")) for item in data.get("models", []) if isinstance(item, dict)]
+        selected = str(config["model"])
+        available = any(name == selected or name.split(":", 1)[0] == selected.split(":", 1)[0] for name in names)
+        if not available:
+            result["message"] = f"Ollama 已连接，但未发现模型 {selected}。"
+            return result
+        result["status"] = "ready"
+        result["message"] = "Embedding 可用，语义检索已启用。"
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        result["message"] = "Ollama 未连接，当前自动使用关键词检索。"
+    return result
+
+
+def test_embedding_connection() -> dict[str, Any]:
+    config = _read_embedding_config()
+    if not config.get("enabled"):
+        return {**get_embedding_status(probe=False), "success": True}
+    try:
+        vectors = _request_embeddings(["期末复习知识库连接测试"])
+        dimension = len(vectors[0]) if vectors else 0
+        return {
+            **get_embedding_status(probe=False),
+            "success": dimension > 0,
+            "status": "ready" if dimension > 0 else "unavailable",
+            "message": f"连接成功，向量维度 {dimension}。" if dimension else "服务未返回有效向量。",
+            "dimension": dimension,
+        }
+    except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError) as error:
+        return {
+            **get_embedding_status(probe=False),
+            "success": False,
+            "status": "unavailable",
+            "message": f"Embedding 连接失败：{error}",
+        }
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_text(text: str) -> str:
+    lines = [line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _split_long_text(text: str, limit: int = 900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    sentences = [item.strip() for item in re.split(r"(?<=[。！？；.!?;])", text) if item.strip()]
+    parts: list[str] = []
+    current = ""
+    for sentence in sentences or [text]:
+        if current and len(current) + len(sentence) > limit:
+            parts.append(current)
+            current = ""
+        if len(sentence) > limit:
+            parts.extend(sentence[index : index + limit] for index in range(0, len(sentence), limit))
+        else:
+            current += sentence
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _chunk_document(text: str) -> list[dict[str, str]]:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+    blocks: list[str] = []
+    for line in normalized.split("\n"):
+        blocks.extend(_split_long_text(line))
+
+    chunks: list[dict[str, str]] = []
+    current: list[str] = []
+    current_length = 0
+    heading = ""
+    for block in blocks:
+        is_heading = len(block) <= 48 and bool(re.match(r"^(第?[一二三四五六七八九十百0-9]+[章节部分页、.．]|[一二三四五六七八九十]+、|\d+[.．])", block))
+        if is_heading:
+            heading = block
+        if current and current_length + len(block) > 1000:
+            content = "\n".join(current).strip()
+            chunks.append({"heading": heading, "content": content})
+            overlap = content[-120:] if len(content) > 120 else ""
+            current = [overlap] if overlap else []
+            current_length = len(overlap)
+        current.append(block)
+        current_length += len(block)
+    if current:
+        content = "\n".join(current).strip()
+        if content:
+            chunks.append({"heading": heading, "content": content})
+
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        fingerprint = _content_hash(chunk["content"])
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(chunk)
+    return unique
+
+
+def sync_material_documents(course_id: str, documents: list[dict[str, str]]) -> dict[str, int]:
+    initialize_knowledge_database()
+    normalized_documents = []
+    for document in documents:
+        relative_path = str(document.get("relativePath", "")).strip()
+        text = _normalize_text(str(document.get("text", "")))
+        if relative_path:
+            normalized_documents.append(
+                {
+                    "relativePath": relative_path,
+                    "name": str(document.get("name") or Path(relative_path).name),
+                    "text": text,
+                    "contentHash": _content_hash(text),
+                }
+            )
+
+    removed_chunk_ids: list[str] = []
+    changed_count = 0
+    with _database_connection() as connection:
+        existing = {
+            row["relative_path"]: row["content_hash"]
+            for row in connection.execute(
+                "SELECT relative_path, content_hash FROM knowledge_materials WHERE course_id = ?",
+                (course_id,),
+            )
+        }
+        current_paths = {item["relativePath"] for item in normalized_documents}
+        stale_paths = set(existing) - current_paths
+        for relative_path in stale_paths:
+            rows = connection.execute(
+                "SELECT id FROM material_chunks WHERE course_id = ? AND relative_path = ?",
+                (course_id, relative_path),
+            ).fetchall()
+            stale_ids = [str(row["id"]) for row in rows]
+            removed_chunk_ids.extend(stale_ids)
+            if stale_ids:
+                try:
+                    connection.executemany(
+                        "DELETE FROM material_chunks_fts WHERE chunk_id = ?",
+                        [(chunk_id,) for chunk_id in stale_ids],
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            connection.execute(
+                "DELETE FROM material_chunks WHERE course_id = ? AND relative_path = ?",
+                (course_id, relative_path),
+            )
+            connection.execute(
+                "DELETE FROM knowledge_materials WHERE course_id = ? AND relative_path = ?",
+                (course_id, relative_path),
+            )
+
+        for document in normalized_documents:
+            relative_path = document["relativePath"]
+            if existing.get(relative_path) == document["contentHash"]:
+                continue
+            changed_count += 1
+            old_rows = connection.execute(
+                "SELECT id FROM material_chunks WHERE course_id = ? AND relative_path = ?",
+                (course_id, relative_path),
+            ).fetchall()
+            old_ids = [str(row["id"]) for row in old_rows]
+            removed_chunk_ids.extend(old_ids)
+            if old_ids:
+                try:
+                    connection.executemany(
+                        "DELETE FROM material_chunks_fts WHERE chunk_id = ?",
+                        [(chunk_id,) for chunk_id in old_ids],
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            connection.execute(
+                "DELETE FROM material_chunks WHERE course_id = ? AND relative_path = ?",
+                (course_id, relative_path),
+            )
+            for index, chunk in enumerate(_chunk_document(document["text"]), start=1):
+                chunk_hash = _content_hash(chunk["content"])
+                chunk_id = hashlib.sha256(
+                    f"{course_id}|{relative_path}|{index}|{chunk_hash}".encode("utf-8")
+                ).hexdigest()[:32]
+                heading = chunk["heading"]
+                locator = heading or f"第 {index} 段"
+                connection.execute(
+                    """
+                    INSERT INTO material_chunks (
+                        id, course_id, relative_path, material_name, chunk_index,
+                        locator, heading, content, content_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk_id,
+                        course_id,
+                        relative_path,
+                        document["name"],
+                        index,
+                        locator,
+                        heading,
+                        chunk["content"],
+                        chunk_hash,
+                        _now(),
+                    ),
+                )
+                try:
+                    connection.execute(
+                        "INSERT INTO material_chunks_fts (chunk_id, course_id, content) VALUES (?, ?, ?)",
+                        (chunk_id, course_id, chunk["content"]),
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO knowledge_materials (
+                    course_id, relative_path, name, content_hash, character_count, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    course_id,
+                    relative_path,
+                    document["name"],
+                    document["contentHash"],
+                    len(document["text"]),
+                    _now(),
+                ),
+            )
+
+        chunk_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM material_chunks WHERE course_id = ?",
+                (course_id,),
+            ).fetchone()[0]
+        )
+
+    if removed_chunk_ids:
+        with _embedding_connection() as connection:
+            connection.executemany(
+                "DELETE FROM chunk_embeddings WHERE chunk_id = ?",
+                [(chunk_id,) for chunk_id in removed_chunk_ids],
+            )
+    return {"materials": len(normalized_documents), "chunks": chunk_count, "changed": changed_count}
+
+
+def rebuild_course_embeddings(course_id: str) -> dict[str, Any]:
+    config = _read_embedding_config()
+    if not config.get("enabled"):
+        raise RuntimeError("Embedding 已关闭")
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT id, content, content_hash FROM material_chunks WHERE course_id = ? ORDER BY relative_path, chunk_index",
+            (course_id,),
+        ).fetchall()
+    if not rows:
+        return {**get_embedding_status(probe=False), "status": "ready", "message": "资料库暂无可索引文字。"}
+
+    model = str(config["model"])
+    with _embedding_connection() as connection:
+        cached = {
+            row["chunk_id"]: row["content_hash"]
+            for row in connection.execute(
+                "SELECT chunk_id, content_hash FROM chunk_embeddings WHERE model = ?",
+                (model,),
+            )
+        }
+    pending = [row for row in rows if cached.get(row["id"]) != row["content_hash"]]
+    for start in range(0, len(pending), 16):
+        batch = pending[start : start + 16]
+        vectors = _request_embeddings([str(row["content"]) for row in batch])
+        with _embedding_connection() as connection:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO chunk_embeddings (
+                    chunk_id, model, content_hash, dimension, vector_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        row["id"],
+                        model,
+                        row["content_hash"],
+                        len(vector),
+                        json.dumps(vector, separators=(",", ":")),
+                        _now(),
+                    )
+                    for row, vector in zip(batch, vectors, strict=True)
+                ],
+            )
+    status = get_embedding_status(probe=False)
+    return {
+        **status,
+        "status": "ready",
+        "message": f"向量索引已更新，本次新增或刷新 {len(pending)} 个分块。",
+    }
+
+
+def _query_terms(query: str) -> list[str]:
+    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9_+.-]{1,}|[\u4e00-\u9fff]{2,}", query.lower())
+    expanded: list[str] = []
+    for term in terms:
+        expanded.append(term)
+        if re.fullmatch(r"[\u4e00-\u9fff]{5,}", term):
+            expanded.extend(term[index : index + 3] for index in range(0, len(term) - 2, 2))
+    return list(dict.fromkeys(expanded))[:12]
+
+
+def _lexical_candidates(course_id: str, query: str, limit: int = 30) -> list[sqlite3.Row]:
+    terms = _query_terms(query)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM material_chunks WHERE course_id = ?",
+            (course_id,),
+        ).fetchall()
+    scored = []
+    for row in rows:
+        lowered = str(row["content"]).lower()
+        score = sum((3 if term in lowered else 0) + lowered.count(term) for term in terms)
+        if score:
+            scored.append((score, row))
+    scored.sort(key=lambda item: (-item[0], int(item[1]["chunk_index"])))
+    return [row for _, row in scored[:limit]]
+
+
+def _keyword_candidates(course_id: str, query: str, limit: int = 30) -> list[sqlite3.Row]:
+    terms = _query_terms(query)
+    fts_rows: list[sqlite3.Row] = []
+    if terms:
+        match_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+        try:
+            with _database_connection() as connection:
+                fts_rows = connection.execute(
+                    """
+                    SELECT chunks.*
+                    FROM material_chunks_fts
+                    JOIN material_chunks AS chunks ON chunks.id = material_chunks_fts.chunk_id
+                    WHERE material_chunks_fts MATCH ? AND material_chunks_fts.course_id = ?
+                    ORDER BY bm25(material_chunks_fts)
+                    LIMIT ?
+                    """,
+                    (match_query, course_id, limit),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            fts_rows = []
+
+    seen = {str(row["id"]) for row in fts_rows}
+    combined = list(fts_rows)
+    for row in _lexical_candidates(course_id, query, limit=limit):
+        if str(row["id"]) in seen:
+            continue
+        combined.append(row)
+        seen.add(str(row["id"]))
+        if len(combined) >= limit:
+            break
+    return combined
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        return -1.0
+    numerator = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return -1.0
+    return numerator / (left_norm * right_norm)
+
+
+def retrieve_material_context(course_id: str, query: str, *, limit: int = 6) -> dict[str, Any]:
+    global _EMBEDDING_UNAVAILABLE_UNTIL
+    initialize_knowledge_database()
+    lexical_rows = _keyword_candidates(course_id, query)
+    ranks: dict[str, float] = {
+        str(row["id"]): 1 / (60 + rank)
+        for rank, row in enumerate(lexical_rows, start=1)
+    }
+    row_by_id = {str(row["id"]): row for row in lexical_rows}
+
+    config = _read_embedding_config()
+    semantic_used = False
+    if config.get("enabled") and time.monotonic() >= _EMBEDDING_UNAVAILABLE_UNTIL:
+        try:
+            query_vector = _request_embeddings([query])[0]
+            with _database_connection() as connection:
+                course_rows = connection.execute(
+                    "SELECT * FROM material_chunks WHERE course_id = ?",
+                    (course_id,),
+                ).fetchall()
+            course_ids = {str(row["id"]) for row in course_rows}
+            row_by_id.update({str(row["id"]): row for row in course_rows})
+            with _embedding_connection() as connection:
+                vector_rows = connection.execute(
+                    "SELECT chunk_id, vector_json FROM chunk_embeddings WHERE model = ?",
+                    (str(config["model"]),),
+                ).fetchall()
+            scored_vectors = []
+            for vector_row in vector_rows:
+                chunk_id = str(vector_row["chunk_id"])
+                if chunk_id not in course_ids:
+                    continue
+                vector = json.loads(vector_row["vector_json"])
+                scored_vectors.append((_cosine_similarity(query_vector, vector), chunk_id))
+            scored_vectors.sort(reverse=True)
+            for rank, (_, chunk_id) in enumerate(scored_vectors[:30], start=1):
+                ranks[chunk_id] = ranks.get(chunk_id, 0) + 1 / (60 + rank)
+            semantic_used = bool(scored_vectors)
+        except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            semantic_used = False
+            _EMBEDDING_UNAVAILABLE_UNTIL = time.monotonic() + 30
+
+    ranked_ids = sorted(ranks, key=lambda chunk_id: ranks[chunk_id], reverse=True)[:limit]
+    items = []
+    for chunk_id in ranked_ids:
+        row = row_by_id[chunk_id]
+        citation = f"{row['material_name']} · {row['locator']}"
+        items.append(
+            {
+                "chunkId": chunk_id,
+                "source": str(row["relative_path"]),
+                "locator": str(row["locator"]),
+                "citation": citation,
+                "content": str(row["content"]),
+            }
+        )
+    context = "\n\n".join(
+        f"[来源：{item['citation']}]\n{item['content']}" for item in items
+    )
+    return {"items": items, "context": context, "semanticUsed": semantic_used}
+
+
+def record_chat_turn(
+    course_id: str,
+    role: str,
+    content: str,
+    *,
+    external_id: str = "",
+    sources: list[dict[str, Any]] | None = None,
+    created_at: str | None = None,
+) -> None:
+    initialize_knowledge_database()
+    with _database_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO chat_turns (
+                external_id, course_id, role, content, sources_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                external_id or None,
+                course_id,
+                role,
+                content,
+                json.dumps(sources or [], ensure_ascii=False),
+                created_at or _now(),
+            ),
+        )
+
+
+def import_workspace_messages(course_id: str, messages: list[dict[str, Any]]) -> None:
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+            continue
+        content = str(message.get("content", "")).strip()
+        if content:
+            record_chat_turn(
+                course_id,
+                str(message["role"]),
+                content,
+                external_id=str(message.get("id", "")),
+                created_at=str(message.get("createdAt") or _now()),
+            )
+
+
+def recent_chat_messages(course_id: str, *, limit: int = 8) -> list[dict[str, str]]:
+    initialize_knowledge_database()
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT role, content FROM chat_turns WHERE course_id = ? ORDER BY id DESC LIMIT ?",
+            (course_id, limit),
+        ).fetchall()
+    return [{"role": str(row["role"]), "content": str(row["content"])} for row in reversed(rows)]
+
+
+def upsert_learner_memory(
+    course_id: str,
+    memory_type: str,
+    content: str,
+    *,
+    knowledge_point_id: str = "",
+    confidence: float = 0.7,
+    source_type: str,
+    evidence_id: str,
+) -> str:
+    normalized = re.sub(r"\s+", " ", content).strip()
+    memory_id = hashlib.sha256(
+        f"{course_id}|{memory_type}|{knowledge_point_id}|{normalized}".encode("utf-8")
+    ).hexdigest()[:32]
+    timestamp = _now()
+    with _database_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO learner_memories (
+                id, course_id, memory_type, knowledge_point_id, content,
+                confidence, status, source_type, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                confidence = MAX(learner_memories.confidence, excluded.confidence),
+                status = 'active',
+                updated_at = excluded.updated_at
+            """,
+            (
+                memory_id,
+                course_id,
+                memory_type,
+                knowledge_point_id,
+                normalized,
+                max(0.0, min(1.0, float(confidence))),
+                source_type,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO memory_evidence (memory_id, evidence_type, evidence_id, created_at) VALUES (?, ?, ?, ?)",
+            (memory_id, source_type, evidence_id, timestamp),
+        )
+    return memory_id
+
+
+def record_learning_event(
+    course_id: str,
+    event_type: str,
+    *,
+    knowledge_point_id: str = "",
+    question_id: str = "",
+    is_correct: bool | None = None,
+    details: dict[str, Any] | None = None,
+) -> str:
+    timestamp = _now()
+    payload = details or {}
+    raw_id = f"{course_id}|{event_type}|{question_id}|{timestamp}|{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+    event_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:32]
+    with _database_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO learning_events (
+                id, course_id, event_type, knowledge_point_id, question_id,
+                is_correct, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                course_id,
+                event_type,
+                knowledge_point_id,
+                question_id,
+                None if is_correct is None else int(is_correct),
+                json.dumps(payload, ensure_ascii=False),
+                timestamp,
+            ),
+        )
+    if is_correct is False:
+        title = str(payload.get("title") or question_id or "一道题")
+        upsert_learner_memory(
+            course_id,
+            "weak_point",
+            f"用户在{event_type}中答错「{title}」，需要继续巩固。",
+            knowledge_point_id=knowledge_point_id,
+            confidence=0.85,
+            source_type="learning_event",
+            evidence_id=event_id,
+        )
+    return event_id
+
+
+def learner_memory_context(course_id: str, query: str, *, limit: int = 5) -> str:
+    terms = _query_terms(query)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM learner_memories
+            WHERE course_id = ? AND status = 'active'
+            ORDER BY updated_at DESC LIMIT 80
+            """,
+            (course_id,),
+        ).fetchall()
+    scored = []
+    for recency, row in enumerate(rows):
+        content = str(row["content"]).lower()
+        lexical = sum(content.count(term) for term in terms)
+        score = lexical * 10 + float(row["confidence"]) + 1 / (recency + 1)
+        scored.append((score, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return "\n".join(f"- {row['content']}" for _, row in scored[:limit])
+
+
+def record_review_progress(
+    course_id: str,
+    previous_tasks: list[dict[str, Any]],
+    current_tasks: list[dict[str, Any]],
+) -> None:
+    previous_by_id = {str(task.get("id")): task for task in previous_tasks if isinstance(task, dict)}
+    default_titles = ["考点与边界", "概念与方法", "例题与迁移", "自测与纠错"]
+    with _database_connection() as connection:
+        for task in current_tasks:
+            if not isinstance(task, dict):
+                continue
+            task_id = str(task.get("id", ""))
+            old_progress = int(previous_by_id.get(task_id, {}).get("progress", 0))
+            new_progress = int(task.get("progress", 0))
+            if new_progress <= old_progress:
+                continue
+            guide = task.get("studyGuide") if isinstance(task.get("studyGuide"), dict) else {}
+            sections = guide.get("sections") if isinstance(guide.get("sections"), list) else []
+            for section_index in range(1, 5):
+                threshold = section_index * 25
+                if not (old_progress < threshold <= new_progress):
+                    continue
+                section = sections[section_index - 1] if len(sections) >= section_index else {}
+                title = str(section.get("title") or default_titles[section_index - 1])
+                content = json.dumps(section, ensure_ascii=False, sort_keys=True) if section else title
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO review_sections (
+                        course_id, task_id, section_index, section_key,
+                        title, content_hash, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        course_id,
+                        task_id,
+                        section_index,
+                        str(section.get("id") or f"section-{section_index}"),
+                        title,
+                        _content_hash(content),
+                        _now(),
+                    ),
+                )
+
+
+def get_knowledge_status(course_id: str) -> dict[str, Any]:
+    initialize_knowledge_database()
+    with _database_connection() as connection:
+        materials = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM knowledge_materials WHERE course_id = ?",
+                (course_id,),
+            ).fetchone()[0]
+        )
+        chunks = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM material_chunks WHERE course_id = ?",
+                (course_id,),
+            ).fetchone()[0]
+        )
+        chats = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM chat_turns WHERE course_id = ?",
+                (course_id,),
+            ).fetchone()[0]
+        )
+        events = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM learning_events WHERE course_id = ?",
+                (course_id,),
+            ).fetchone()[0]
+        )
+        memories = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM learner_memories WHERE course_id = ? AND status = 'active'",
+                (course_id,),
+            ).fetchone()[0]
+        )
+    return {
+        "courseId": course_id,
+        "materials": materials,
+        "chunks": chunks,
+        "chatTurns": chats,
+        "learningEvents": events,
+        "memories": memories,
+        "embedding": get_embedding_status(probe=False),
+    }

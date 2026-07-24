@@ -1,0 +1,416 @@
+export type LearningModule =
+  | 'overview'
+  | 'materials'
+  | 'strategy'
+  | 'plan'
+  | 'practice'
+  | 'mock'
+  | 'notes'
+  | 'errors'
+  | 'archive'
+  | 'settings'
+
+export type SearchResult = {
+  id: string
+  type: 'material' | 'knowledge' | 'note' | 'wrong-answer' | 'question'
+  module: LearningModule
+  title: string
+  excerpt: string
+  source: string
+}
+
+export type ModelProvider = 'openai' | 'deepseek' | 'glm' | 'custom'
+
+export type UiFont =
+  | 'system'
+  | 'lakeus-night-writing'
+  | 'maple-mono-nf-cn'
+  | 'honglei-banshu'
+  | 'liyu-xingkai'
+  | 'nanxi-ink-song'
+  | 'lxgw-wenkai'
+  | 'xuanzongti'
+  | 'slidexiaxing'
+  | 'slideyouran'
+
+export type UiFontSize = 90 | 95 | 100 | 105 | 110 | 115
+
+export type ModelProfile = {
+  provider: ModelProvider
+  baseUrl: string
+  model: string
+  apiKey: string
+  hasApiKey?: boolean
+  availableModels?: string[]
+  supportsVision: boolean
+  status: 'unconfigured' | 'saved' | 'testing' | 'connected' | 'error'
+  statusMessage: string
+  lastTestedAt?: string
+}
+
+export type Course = {
+  id: string
+  name: string
+  examDate: string
+  targetScore: number
+  progress: number
+  dailyHours: number
+  color: string
+  icon: 'code' | 'physics' | 'math' | 'english' | 'system' | 'database'
+}
+
+export type StudyConcept = {
+  title: string
+  body: string
+  formula?: string
+  source?: string
+}
+
+export type StudyFormula = {
+  expression: string
+  meaning: string
+  conditions: string
+}
+
+export type StudyExamPoint = {
+  id: string
+  title: string
+  importance: 'high' | 'medium' | 'low'
+  teachingMode: 'concept' | 'calculation' | 'proof' | 'application'
+  explanation: string
+  formulas?: StudyFormula[]
+  procedure?: string[]
+  questionTypes?: string[]
+  pitfalls?: string[]
+  sourceRefs: string[]
+}
+
+export type StudyWorkedExample = {
+  id?: string
+  title: string
+  origin?: 'material' | 'ai-adapted'
+  source?: string
+  problem?: string
+  analysis?: string
+  setup?: string
+  steps: string[]
+  answer?: string
+  conclusion?: string
+  checks?: string[]
+  examPointIds?: string[]
+}
+
+export type StudyGuideSection = {
+  id: 'exam-focus' | 'method' | 'worked-example' | 'self-check' | string
+  label: string
+  title: string
+  objectives?: string[]
+  sourceHighlights?: string[]
+  concepts?: StudyConcept[]
+  example?: StudyGuide['example']
+  planningReason?: string
+  examPoints?: StudyExamPoint[]
+  workedExamples?: StudyWorkedExample[]
+  selfTestQuestionIds?: string[]
+  checklist?: string[]
+}
+
+export type StudyGuide = {
+  planningReason?: string
+  examPoints?: StudyExamPoint[]
+  workedExamples?: StudyWorkedExample[]
+  selfTestQuestionIds?: string[]
+  objectives?: string[]
+  sourceHighlights?: string[]
+  concepts?: StudyConcept[]
+  example?: {
+    title: string
+    setup: string
+    steps: string[]
+    conclusion: string
+  }
+  checklist?: string[]
+  sections?: StudyGuideSection[]
+}
+
+export type EmbeddingProfile = {
+  enabled: boolean
+  provider: 'ollama'
+  baseUrl: string
+  model: string
+  status: 'disabled' | 'ready' | 'unavailable' | 'indexing'
+  message: string
+  indexedChunks: number
+  totalChunks: number
+  dimension: number
+}
+
+export type KnowledgeBaseStatus = {
+  courseId: string
+  materials: number
+  chunks: number
+  chatTurns: number
+  learningEvents: number
+  memories: number
+  embedding: EmbeddingProfile
+}
+
+export type McpServer = {
+  id: string
+  name: string
+  endpoint: string
+  transport: 'http' | 'stdio'
+  command: string
+  args: string[]
+  tools: Array<{
+    name: string
+    description?: string
+    inputSchema?: Record<string, unknown>
+  }>
+  allowedTools: string[]
+}
+
+export type ExternalSource = {
+  id: string
+  courseId: string
+  url: string
+  sourceType: 'web' | 'video' | 'note'
+  title: string
+  status: 'queued' | 'fetching' | 'pending_review' | 'approved' | 'dismissed' | 'failed'
+  content: string
+  metadata: Record<string, unknown>
+  error: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type PlanTask = {
+  id: string
+  courseId: string
+  day?: number
+  order: number
+  title: string
+  description: string
+  source: string
+  duration: number
+  progress: number
+  weight: number
+  knowledgePointId?: string
+  status: 'pending' | 'in-progress' | 'completed'
+  priority: 'high' | 'medium' | 'low'
+  studyGuide?: StudyGuide
+  contentQualityWarning?: string
+}
+
+export type WrongAnswer = {
+  id: string
+  questionId?: string
+  questionType?: '摸底测试' | '主线学习' | '刷题练习' | '模拟卷' | '错题重做'
+  source?: string
+  addedAt?: string
+  reviewedAt?: string
+  title: string
+  tag: string
+  mistakeType: string
+  count: number
+  isReviewed: boolean
+}
+
+export type ArchiveItem = {
+  id: string
+  itemType: 'course' | 'wrong-answer'
+  entityId: string
+  title: string
+  courseId?: string
+  courseName?: string
+  deletedAt: string
+  purgeAfter: string
+}
+
+export type StudyMessage = {
+  id: string
+  role: 'assistant' | 'user'
+  content: string
+  createdAt: string
+}
+
+export type AdjustmentProposal = {
+  id: string
+  courseId?: string
+  baseRevision?: number
+  title: string
+  reason: string
+  impact: string
+  status: 'pending' | 'applied' | 'dismissed'
+  operations?: Array<Record<string, unknown>>
+  before?: Record<string, unknown>
+  after?: Record<string, unknown>
+}
+
+export type Material = {
+  name: string
+  relativePath: string
+  type: string
+  size: number
+  detail: string
+  analysisVersion?: number
+  parser?: string
+  parsedCharacters?: number
+  aiStatus?: 'ready' | 'partial' | 'skipped' | 'unreadable'
+  aiLabel?: string
+  aiMessage?: string
+  aiReadable?: boolean
+  previewStatus?: 'ready' | 'converted' | 'limited' | 'unsupported'
+  previewLabel?: string
+  previewMessage?: string
+}
+
+export type MaterialPreview = {
+  name: string
+  relativePath: string
+  type: string
+  kind: 'image' | 'pdf' | 'text' | 'sheet' | 'unsupported'
+  message: string
+  isConvertedPreview?: boolean
+  aiStatus?: Material['aiStatus']
+  aiLabel?: string
+  aiMessage?: string
+  previewStatus?: Material['previewStatus']
+  previewLabel?: string
+  previewMessage?: string
+  text?: string
+  sheets?: Array<{
+    name: string
+    rows: string[][]
+  }>
+}
+
+export type MaterialMemory = {
+  digest: string
+  sourceCount: number
+  aiReadableCount: number
+  aiPartialCount: number
+  aiSkippedCount: number
+  aiUnreadableCount: number
+  lastChange: string
+  lastSyncedAt: string
+  contentRefreshRecommended: boolean
+  summary: string
+}
+
+export type CourseOnboarding = {
+  status: 'draft' | 'diagnostic' | 'strategy-review' | 'planned'
+  courseName: string
+  examDate: string
+  targetScore: number
+  targetText: string
+  dailyHours: number
+  days: number
+  examFormat: string
+  remarks: string
+  diagnosticScore?: number
+  diagnosticTotal?: number
+  diagnosticPercent?: number
+}
+
+export type StrategyDocument = {
+  content: string
+  version: number
+  updatedAt: string
+  updatedBy: 'ai' | 'user'
+  changeSummary?: string
+}
+
+export type StrategyDocuments = {
+  status: 'generating' | 'review' | 'approved' | 'maintenance-error'
+  reviewPlan: StrategyDocument
+  coursePrompt: StrategyDocument
+  maintenancePending: boolean
+  maintenanceError?: string
+}
+
+export type AgentJob = {
+  id: string
+  courseId: string
+  jobType: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  attempts: number
+  maxAttempts: number
+  error: string
+  result: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
+}
+
+export type KnowledgePoint = {
+  id: string
+  name: string
+  mastery: number
+  weight: number
+  summary: string
+  source: string
+}
+
+export type QuizQuestion = {
+  id: string
+  type: 'single'
+  score: number
+  prompt: string
+  options: string[]
+  answerIndex: number
+  explanation: string
+  knowledgePointId: string
+  source: string
+  taskId?: string
+  examPointIds?: string[]
+}
+
+export type StudyWorkspace = {
+  revision?: number
+  planRevision?: number
+  course: Course
+  assessmentProfile: {
+    summary: string
+    questionTypes: string[]
+  }
+  diagnostic: {
+    estimatedScore: string
+    message: string
+  }
+  knowledgePoints: KnowledgePoint[]
+  tasks: PlanTask[]
+  practiceQuestions: QuizQuestion[]
+  mockQuestions: QuizQuestion[]
+  materials: Material[]
+  materialMemory?: MaterialMemory
+  knowledgeBase?: KnowledgeBaseStatus
+  diagnosticQuestions?: QuizQuestion[]
+  onboarding?: CourseOnboarding
+  strategyDocuments?: StrategyDocuments
+  wrongAnswers: WrongAnswer[]
+  note: string
+  messages: StudyMessage[]
+  generatedAt: string
+  generationMode: 'ai' | 'fallback'
+}
+
+export type PracticeAnswerResult = {
+  correct: boolean
+  explanation: string
+  mastery: number
+  generatedSimilarCount: number
+  workspace: StudyWorkspace
+}
+
+export type MockSubmitResult = {
+  score: number
+  total: number
+  results: Array<{
+    id: string
+    correct: boolean
+    explanation: string
+    mastery: number
+    generatedSimilarCount: number
+  }>
+  workspace: StudyWorkspace
+}

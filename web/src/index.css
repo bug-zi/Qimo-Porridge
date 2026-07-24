@@ -1,0 +1,155 @@
+:root {
+  --font-system:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Microsoft YaHei", sans-serif;
+  --app-font-family: var(--font-system);
+  --app-font-scale: 1;
+  font-family: var(--app-font-family);
+  color: #25252d;
+  background: #fff9fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@font-face {
+  font-family: "FinalCongee Lakeus Night Writing";
+  src: url("/fonts/851-lakeus-night-writing-regular.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee Maple Mono NF CN";
+  src: url("/fonts/maple-mono-nf-cn-regular.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee Honglei Banshu";
+  src: url("/fonts/honglei-banshu-regular.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee Liyu Xingkai";
+  src: url("/fonts/liyu-xingkai.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee Nanxi Ink Song";
+  src: url("/fonts/nanxi-ink-song.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee LXGW WenKai";
+  src: url("/fonts/lxgw-wenkai-regular.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee XuanZongTi";
+  src: url("/fonts/xuanzongti.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee Slidexiaxing";
+  src: url("/fonts/slidexiaxing-regular.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "FinalCongee Slideyouran";
+  src: url("/fonts/slideyouran-regular.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
+:root[data-app-font='system'] {
+  --app-font-family: var(--font-system);
+}
+
+:root[data-app-font='lakeus-night-writing'] {
+  --app-font-family: "FinalCongee Lakeus Night Writing", var(--font-system);
+}
+
+:root[data-app-font='maple-mono-nf-cn'] {
+  --app-font-family: "FinalCongee Maple Mono NF CN", ui-monospace, var(--font-system);
+}
+
+:root[data-app-font='honglei-banshu'] {
+  --app-font-family: "FinalCongee Honglei Banshu", var(--font-system);
+}
+
+:root[data-app-font='liyu-xingkai'] {
+  --app-font-family: "FinalCongee Liyu Xingkai", var(--font-system);
+}
+
+:root[data-app-font='nanxi-ink-song'] {
+  --app-font-family: "FinalCongee Nanxi Ink Song", var(--font-system);
+}
+
+:root[data-app-font='lxgw-wenkai'] {
+  --app-font-family: "FinalCongee LXGW WenKai", var(--font-system);
+}
+
+:root[data-app-font='xuanzongti'] {
+  --app-font-family: "FinalCongee XuanZongTi", var(--font-system);
+}
+
+:root[data-app-font='slidexiaxing'] {
+  --app-font-family: "FinalCongee Slidexiaxing", var(--font-system);
+}
+
+:root[data-app-font='slideyouran'] {
+  --app-font-family: "FinalCongee Slideyouran", var(--font-system);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-width: 320px;
+  height: 100%;
+  min-height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}

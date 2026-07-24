@@ -1,0 +1,48 @@
+# ===== Secrets (never commit) =====
+.env
+.env.*
+!.env.example
+
+# ===== Python (backend) =====
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backend runtime data (DBs, uploaded materials, workspace state)
+backend/data/*
+!backend/data/.gitkeep
+
+# ===== Node (web) =====
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# ===== Build / runtime output =====
+output/
+.playwright-cli/
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ===== Agent / tooling caches =====
+.agents/
