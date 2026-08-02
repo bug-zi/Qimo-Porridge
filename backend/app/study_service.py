@@ -5349,6 +5349,7 @@ def agent_chat_stream(
     reply = ""
     proposal: dict[str, Any] | None = None
     sources: list[dict[str, Any]] = []
+    tool_events: list[dict[str, Any]] = []
     run_id: str | None = None
     try:
         for kind, payload in run_tutor_agent_stream(
@@ -5370,6 +5371,7 @@ def agent_chat_stream(
                 reply = str(payload.get("reply", ""))
                 proposal = payload.get("proposal")
                 sources = payload.get("sources", [])
+                tool_events = payload.get("toolEvents", []) or []
                 run_id = payload.get("runId")
                 break
     except Exception:
@@ -5433,6 +5435,8 @@ def agent_chat_stream(
                 "mode": conversation_mode,
                 "content": reply,
                 "createdAt": "刚刚",
+                "toolEvents": tool_events,
+                "sources": sources,
             },
         ]
     )
@@ -5446,6 +5450,7 @@ def agent_chat_stream(
             "proposal": proposal,
             "sources": sources,
             "runId": run_id,
+            "toolEvents": tool_events,
             "workspace": latest_workspace,
         },
     )

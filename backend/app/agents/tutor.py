@@ -144,6 +144,9 @@ def run_tutor_agent_stream(
     run_id = create_agent_run(course_id, "tutor_chat_stream", {"messageCount": len(messages)})
     proposal: dict[str, Any] | None = None
     sources: list[dict[str, Any]] = []
+    # 收集本轮流式工具事件（tool_start/tool_end），随 done 回传给前端并落库进助手消息，
+    # 这样对话历史里始终能看到“检索了 N 条资料 / 读取了学习状态”等行动轨迹，而不是事后只剩纯文本。
+    collected_tool_events: list[dict[str, Any]] = []
     try:
         for step_index in range(1, max_steps + 1):
             yield ("step", {"step": step_index})
@@ -159,7 +162,7 @@ def run_tutor_agent_stream(
                 reply = "".join(content_parts).strip() or "当前没有生成可用回答，请补充更具体的问题。"
                 record_agent_step(run_id, step_index, "tutor", "completed", output_data={"reply": reply})
                 finish_agent_run(run_id, {"proposalId": proposal.get("id") if proposal else ""})
-                yield ("done", {"reply": reply, "proposal": proposal, "sources": sources, "runId": run_id})
+                yield ("done", {"reply": reply, "proposal": proposal, "sources": sources, "runId": run_id, "toolEvents": collected_tool_events})
                 return
             tool_calls = turn.get("toolCalls", [])
             if not tool_calls:
@@ -168,21 +171,23 @@ def run_tutor_agent_stream(
                     reply = "当前没有生成可用回答，请补充更具体的问题。"
                 record_agent_step(run_id, step_index, "tutor", "completed", output_data={"reply": reply})
                 finish_agent_run(run_id, {"proposalId": proposal.get("id") if proposal else ""})
-                yield ("done", {"reply": reply, "proposal": proposal, "sources": sources, "runId": run_id})
+                yield ("done", {"reply": reply, "proposal": proposal, "sources": sources, "runId": run_id, "toolEvents": collected_tool_events})
                 return
 
             messages.append(turn["assistantMessage"])
             for call in tool_calls:
                 name = str(call.get("name", ""))
                 arguments = call.get("arguments", {})
-                yield (
-                    "tool_start",
-                    {
-                        "step": step_index,
-                        "name": name,
-                        "label": TOOL_LABELS.get(name, f"正在执行 {name}…"),
-                    },
-                )
+                label = TOOL_LABELS.get(name, f"正在执行 {name}…")
+                tool_event: dict[str, Any] = {
+                    "step": step_index,
+                    "name": name,
+                    "status": "running",
+                    "label": label,
+                    "summary": "",
+                }
+                collected_tool_events.append(tool_event)
+                yield ("tool_start", {"step": step_index, "name": name, "label": label})
                 try:
                     result = execute_agent_tool(
                         course_id,
@@ -210,10 +215,9 @@ def run_tutor_agent_stream(
                     record_agent_step(run_id, step_index, f"tool:{name}", "failed", error=error)
                     tool_content = json.dumps({"error": str(error)}, ensure_ascii=False)
                     summary = f"{name} 执行失败"
-                yield (
-                    "tool_end",
-                    {"step": step_index, "name": name, "summary": summary},
-                )
+                tool_event["status"] = "done"
+                tool_event["summary"] = summary
+                yield ("tool_end", {"step": step_index, "name": name, "summary": summary})
                 messages.append(
                     {
                         "role": "tool",
@@ -241,7 +245,7 @@ def run_tutor_agent_stream(
         if not reply:
             reply = "我已经检索了资料并核对了学习状态，但本轮思考步数较多，先在这里停下。如需继续深入，请告诉我更具体的方向。"
         finish_agent_run(run_id, {"proposalId": proposal.get("id") if proposal else "", "stepLimitReached": True})
-        yield ("done", {"reply": reply, "proposal": proposal, "sources": sources, "runId": run_id})
+        yield ("done", {"reply": reply, "proposal": proposal, "sources": sources, "runId": run_id, "toolEvents": collected_tool_events})
     except Exception as error:
         fail_agent_run(run_id, error)
         raise

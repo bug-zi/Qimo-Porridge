@@ -2,6 +2,7 @@ export type LearningModule =
   | 'overview'
   | 'materials'
   | 'strategy'
+  | 'mindmap'
   | 'plan'
   | 'practice'
   | 'mock'
@@ -46,6 +47,11 @@ export type ModelProfile = {
   status: 'unconfigured' | 'saved' | 'testing' | 'connected' | 'error'
   statusMessage: string
   lastTestedAt?: string
+}
+
+export type UserProfilePrompt = {
+  content: string
+  updatedAt: string
 }
 
 export type Course = {
@@ -230,8 +236,24 @@ export type ArchiveItem = {
 export type StudyMessage = {
   id: string
   role: 'assistant' | 'user'
+  mode?: 'chat' | 'agent'
   content: string
   createdAt: string
+  toolEvents?: StreamingToolEvent[]
+  sources?: Array<Record<string, unknown>>
+}
+
+export type StreamingToolEvent = {
+  step: number
+  name: string
+  label: string
+  status: 'running' | 'done'
+  summary?: string
+}
+
+export type StreamingMessage = {
+  content: string
+  toolEvents: StreamingToolEvent[]
 }
 
 export type AdjustmentProposal = {
@@ -353,16 +375,77 @@ export type KnowledgePoint = {
 
 export type QuizQuestion = {
   id: string
-  type: 'single'
+  type: 'single' | 'calculation'
+  questionType?: string
   score: number
   prompt: string
   options: string[]
   answerIndex: number
+  referenceAnswer?: string
+  gradingRubric?: string[]
   explanation: string
   knowledgePointId: string
   source: string
   taskId?: string
   examPointIds?: string[]
+}
+
+export type MindMapNodeType =
+  | 'course'
+  | 'chapter'
+  | 'knowledge'
+  | 'task'
+  | 'material'
+  | 'question'
+  | 'wrongAnswer'
+
+export type MindMapNode = {
+  id: string
+  type: MindMapNodeType
+  title: string
+  summary?: string
+  knowledgePointId?: string
+  taskId?: string
+  materialPath?: string
+  questionId?: string
+  wrongAnswerId?: string
+  source?: string
+  mastery?: number
+  weight?: number
+  status?: string
+  moduleId?: string
+  order?: number
+  kind?: 'module' | 'bucket'
+  position?: {
+    x: number
+    y: number
+  }
+  collapsed?: boolean
+}
+
+export type MindMapEdge = {
+  id: string
+  source: string
+  target: string
+  label?: string
+}
+
+export type CourseMindMap = {
+  version: number
+  courseId: string
+  generatedAt: string
+  sourceRevision?: number
+  modules?: Array<{ id: string; title: string; order: number }>
+  layout: 'tree-right'
+  layouted?: boolean
+  layoutVersion?: number
+  viewport?: {
+    x: number
+    y: number
+    zoom: number
+  }
+  nodes: MindMapNode[]
+  edges: MindMapEdge[]
 }
 
 export type StudyWorkspace = {
@@ -388,10 +471,16 @@ export type StudyWorkspace = {
   onboarding?: CourseOnboarding
   strategyDocuments?: StrategyDocuments
   wrongAnswers: WrongAnswer[]
+  practiceAnswers?: Record<string, PracticeAnswerRecord>
+  mockResult?: MockResultRecord | null
   note: string
   messages: StudyMessage[]
   generatedAt: string
   generationMode: 'ai' | 'fallback'
+  planStartDate?: string
+  timeLog?: TimeLogEntry[]
+  dailyProgress?: DailyProgress
+  pendingProposals?: AdjustmentProposal[]
 }
 
 export type PracticeAnswerResult = {
@@ -408,9 +497,65 @@ export type MockSubmitResult = {
   results: Array<{
     id: string
     correct: boolean
+    earnedScore?: number
     explanation: string
     mastery: number
     generatedSimilarCount: number
   }>
   workspace: StudyWorkspace
+}
+
+export type MockAnswer = number | string
+
+export type PracticeAnswerRecord = {
+  answerIndex: number
+  correct: boolean
+  explanation: string
+  mastery: number
+  answeredAt: string
+  mode: string
+}
+
+export type MockResultRecord = {
+  submittedAt: string
+  score: number
+  total: number
+  answers: Record<string, MockAnswer>
+  results: Array<{
+    id: string
+    correct: boolean
+    earnedScore?: number
+    explanation: string
+    mastery: number
+    generatedSimilarCount: number
+  }>
+}
+
+export type TimeLogEntry = {
+  id: string
+  taskId: string
+  date: string
+  minutes: number
+  note: string
+  createdAt: string
+}
+
+export type OverdueTaskRef = {
+  id: string
+  title: string
+  day: number
+  duration: number
+  priority: 'high' | 'medium' | 'low'
+  status: string
+}
+
+export type DailyProgress = {
+  date: string
+  todayDay: number
+  maxDay: number
+  plannedToday: number
+  spentToday: number
+  remaining: number
+  overBudget: boolean
+  overdue: OverdueTaskRef[]
 }
