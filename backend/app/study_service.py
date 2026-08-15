@@ -26,6 +26,7 @@ from .agents import run_content_workflow, run_strategy_workflow, with_structured
 from .agents.tools import apply_operations_to_copy
 from .agents.tutor import run_tutor_agent, run_tutor_agent_stream
 from .agents.workflow import _shuffle_single_choice_options, _shuffle_single_choice_questions
+from . import ocr_service
 from . import study_scheduler
 from .knowledge_service import (
     build_conversation_memory,
@@ -1119,6 +1120,46 @@ def _sheets_to_markdown(sheets: list[dict[str, Any]]) -> str:
     return _normalize_extracted_text("\n".join(sections))
 
 
+def _ocr_fallback_for_scanned_pdf(file_path: Path) -> tuple[str, str, list[str]]:
+    """扫描版 PDF 的 OCR 级联：RapidOCR 全文快筛 → 薄弱页视觉模型兜底。
+
+    返回 (text, parser, errors)。RapidOCR 逐页识别后，平均每页字符数
+    低于阈值的文件视为版面复杂/手写，把识别量最少的页面（至多
+    VISION_FALLBACK_MAX_PAGES 页）交给视觉模型重做，取两者较优结果。
+    """
+    errors: list[str] = []
+    rapid_text, rapid_error = ocr_service.extract_scanned_pdf_with_rapidocr(file_path)
+    normalized = _normalize_extracted_text(rapid_text)
+    if not normalized:
+        if rapid_error:
+            errors.append(rapid_error)
+        return "", "", errors
+
+    page_count, avg_chars = ocr_service.summarize_ocr_pages(normalized)
+    if avg_chars >= ocr_service.OCR_MIN_CHARS_PER_PAGE:
+        return normalized, f"RapidOCR 本地 OCR（{page_count} 页）", errors
+
+    # RapidOCR 结果偏薄：挑识别量最少的页面升级视觉模型。
+    if rapid_error:
+        errors.append(rapid_error)
+    page_sizes: list[tuple[int, int]] = []
+    for index, section in enumerate(normalized.split("<!-- 第 ")[1:], start=1):
+        body = section.split("-->", 1)[-1] if "-->" in section else section
+        page_sizes.append((len(body.replace("\n", "").strip()), index))
+    weak_pages = [number for _, number in sorted(page_sizes)[: ocr_service.VISION_FALLBACK_MAX_PAGES]]
+    vision_text, vision_error = ocr_service.extract_pdf_pages_for_vision(
+        file_path,
+        weak_pages,
+        lambda messages: _model_completion(messages),  # type: ignore[arg-type]
+    )
+    vision_normalized = _normalize_extracted_text(vision_text)
+    if len(vision_normalized) > len(normalized):
+        return vision_normalized, f"AI 视觉 OCR（扫描 PDF {len(weak_pages)} 页兜底）", errors
+    if vision_error:
+        errors.append(vision_error)
+    return normalized, f"RapidOCR 本地 OCR（{page_count} 页，部分页识别较薄）", errors
+
+
 def _extract_native_xlsx(file_path: Path) -> tuple[str, str]:
     try:
         return _sheets_to_markdown(_extract_xlsx_preview(file_path)), ""
@@ -1140,11 +1181,19 @@ def _extract_material_content(file_path: Path, *, force_reparse: bool = False) -
         text = _normalize_extracted_text(file_path.read_text(encoding="utf-8", errors="replace"))
         parser = "内置文本读取"
     elif suffix in IMAGE_SUFFIXES:
-        text, error = _extract_image_with_vision(file_path)
+        # 级联：RapidOCR 本地免费快筛 → 字符过少再走视觉模型。
+        text, error = ocr_service.extract_image_with_rapidocr(file_path)
         if text:
-            parser = "AI 视觉 OCR"
+            parser = "RapidOCR 本地 OCR"
         elif error:
             errors.append(error)
+        if len(_normalize_extracted_text(text)) < ocr_service.OCR_MIN_CHARS_PER_PAGE:
+            vision_text, vision_error = _extract_image_with_vision(file_path)
+            if len(_normalize_extracted_text(vision_text)) > len(_normalize_extracted_text(text)):
+                text = vision_text
+                parser = "AI 视觉 OCR"
+            if vision_error:
+                errors.append(vision_error)
     elif suffix == "xlsx":
         if suffix in MARKITDOWN_SUFFIXES:
             text, error = _extract_with_markitdown(file_path)
@@ -1207,6 +1256,12 @@ def _extract_material_content(file_path: Path, *, force_reparse: bool = False) -
             text = excerpt
             parser = f"内置 PPTX 文本读取（{slide_count} 页）"
 
+    # 扫描版 PDF 兜底：文本层提取为空时，走 RapidOCR 本地识别，
+    # 仍不足再对薄弱页升级视觉模型（见 _ocr_fallback_for_scanned_pdf）。
+    if suffix == "pdf" and not _normalize_extracted_text(text):
+        text, parser, ocr_errors = _ocr_fallback_for_scanned_pdf(file_path)
+        errors.extend(ocr_errors)
+
     parsed = {
         "parser": parser,
         "text": text,
@@ -1246,7 +1301,7 @@ def _build_ai_status(file_path: Path, parsed: dict[str, Any]) -> dict[str, Any]:
             "aiMessage": f"图片视觉 OCR 未提取到内容。{f' 原因：{errors[0]}' if errors else ''}",
         }
     elif suffix == "pdf":
-        message = "PDF 可预览，但暂未抽取到文字；扫描版 PDF 需要 OCR 后才适合进入 AI。"
+        message = "PDF 可预览，但未抽取到文字，OCR 级联（RapidOCR + 视觉模型）也未能提取内容。"
     elif suffix == "ppt":
         message = "旧版 PPT 需要 LibreOffice 转 PDF 后再解析；当前只记录文件名。"
     elif suffix == "xls":
