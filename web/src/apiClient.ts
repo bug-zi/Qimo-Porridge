@@ -1,0 +1,77 @@
+/**
+ * API 门面：按 VITE_DEMO_MODE 分发到本地后端实现（./api）或演示模式实现（./demo/demoApi）。
+ * 消费文件统一从这里 import，签名与类型与 ./api 完全一致。
+ */
+import * as localApi from './api'
+import demoApi from './demo/demoApi'
+
+const isDemo = import.meta.env.VITE_DEMO_MODE === 'true'
+const impl = isDemo ? demoApi : localApi
+
+export const listCourses = impl.listCourses
+export const createCourse = impl.createCourse
+export const deleteCourse = impl.deleteCourse
+export const getCourseWorkspace = impl.getCourseWorkspace
+export const getCourseMindMap = impl.getCourseMindMap
+export const generateCourseMindMap = impl.generateCourseMindMap
+export const regroupCourseMindMapModules = impl.regroupCourseMindMapModules
+export const saveCourseMindMap = impl.saveCourseMindMap
+export const searchCourse = impl.searchCourse
+export const saveCourseSetup = impl.saveCourseSetup
+export const submitCourseDiagnostic = impl.submitCourseDiagnostic
+export const getStrategyDocuments = impl.getStrategyDocuments
+export const generateStrategyDocuments = impl.generateStrategyDocuments
+export const saveStrategyDocuments = impl.saveStrategyDocuments
+export const approveStrategyDocuments = impl.approveStrategyDocuments
+export const approveStrategyDocumentsInBackground = impl.approveStrategyDocumentsInBackground
+export const getAgentJob = impl.getAgentJob
+export const saveCoursePrompt = impl.saveCoursePrompt
+export const getCourseMaterialPreview = impl.getCourseMaterialPreview
+export const getCourseMaterialFileUrl = impl.getCourseMaterialFileUrl
+export const getCourseMaterialConvertedFileUrl = impl.getCourseMaterialConvertedFileUrl
+export const rescanCourseMaterials = impl.rescanCourseMaterials
+export const uploadCourseMaterials = impl.uploadCourseMaterials
+export const deleteCourseMaterial = impl.deleteCourseMaterial
+export const getRuntimeModel = impl.getRuntimeModel
+export const saveRuntimeModel = impl.saveRuntimeModel
+export const getUserProfilePrompt = impl.getUserProfilePrompt
+export const saveUserProfilePrompt = impl.saveUserProfilePrompt
+export const getEmbeddingProfile = impl.getEmbeddingProfile
+export const saveEmbeddingProfile = impl.saveEmbeddingProfile
+export const testEmbeddingProfile = impl.testEmbeddingProfile
+export const rebuildKnowledgeEmbeddings = impl.rebuildKnowledgeEmbeddings
+export const getKnowledgeBaseStatus = impl.getKnowledgeBaseStatus
+export const submitCoursePracticeAnswer = impl.submitCoursePracticeAnswer
+export const submitCourseWrongAnswerRetry = impl.submitCourseWrongAnswerRetry
+export const submitCourseMockAnswers = impl.submitCourseMockAnswers
+export const clearCoursePracticeAnswer = impl.clearCoursePracticeAnswer
+export const clearCourseMockResult = impl.clearCourseMockResult
+export const updateCourseWorkspace = impl.updateCourseWorkspace
+export const flushCourseWorkspaceNote = impl.flushCourseWorkspaceNote
+export const recordCourseTimeLog = impl.recordCourseTimeLog
+export const deleteCourseTimeLog = impl.deleteCourseTimeLog
+export const askCourseAgent = impl.askCourseAgent
+export const streamCourseAgent = impl.streamCourseAgent
+export const applyCourseAdjustmentProposal = impl.applyCourseAdjustmentProposal
+export const dismissCourseAdjustmentProposal = impl.dismissCourseAdjustmentProposal
+export const adjustCoursePlan = impl.adjustCoursePlan
+export const listMcpServers = impl.listMcpServers
+export const saveMcpServer = impl.saveMcpServer
+export const discoverMcpServer = impl.discoverMcpServer
+export const submitCourseExternalSource = impl.submitCourseExternalSource
+export const getCourseExternalSource = impl.getCourseExternalSource
+export const approveCourseExternalSource = impl.approveCourseExternalSource
+export const dismissCourseExternalSource = impl.dismissCourseExternalSource
+export const deleteCourseWrongAnswer = impl.deleteCourseWrongAnswer
+export const listArchiveItems = impl.listArchiveItems
+export const restoreArchiveItem = impl.restoreArchiveItem
+export const toRuntimeModelProfile = impl.toRuntimeModelProfile
+
+export type {
+  AgentStreamDone,
+  AgentStreamHandlers,
+  AgentStreamHandle,
+} from './api'
+
+/** 演示模式标记：SettingsView 等需要短路真实网络请求的场合使用。 */
+export const isDemoMode = isDemo

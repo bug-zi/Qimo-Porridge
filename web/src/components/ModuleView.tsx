@@ -81,7 +81,7 @@ import {
   getCourseMaterialPreview,
   listMcpServers,
   submitCourseExternalSource,
-} from '../api'
+} from '../apiClient'
 import { SettingsView } from './SettingsView'
 import { PlanningView } from './PlanningView'
 

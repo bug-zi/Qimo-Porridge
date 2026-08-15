@@ -1,0 +1,1252 @@
+/**
+ * 演示模式的 API 实现：与 ../api.ts 完全同签名（经 ApiSurface 类型约束），
+ * 数据来自 web/public/demo/snapshot.json（后端快照，导出时已清洗敏感信息），
+ * 全部状态保存在内存 store 中——刷新页面即重置，适合公开演示。
+ *
+ * 与真实后端的行为对齐点（详见各函数注释）：
+ * - dailyProgress 按访问当天用后端同款公式重算（study_service.build_daily_progress）；
+ * - 考试日期在加载时整体平移到未来，保证演示永远处于"考前"状态；
+ * - agent 流式对话按 SSE 事件合同回调（token/step/tool_start/tool_end/done），
+ *   done 的 workspace 中追加本轮 user/assistant 消息（对齐 study_service.py 行为）。
+ */
+import type {
+  AdjustmentProposal,
+  AgentJob,
+  ArchiveItem,
+  Course,
+  CourseMindMap,
+  DailyProgress,
+  EmbeddingProfile,
+  ExternalSource,
+  KnowledgeBaseStatus,
+  MaterialPreview,
+  McpServer,
+  MockSubmitResult,
+  ModelProfile,
+  PlanParamsAdjustRequest,
+  PlanParamsAdjustResponse,
+  PlanTask,
+  PracticeAnswerResult,
+  SearchResult,
+  StrategyDocuments,
+  StudyMessage,
+  StudyWorkspace,
+  TimeLogEntry,
+  UserProfilePrompt,
+} from '../types'
+import { fillScriptPlaceholders, matchAgentScript } from './scripts'
+
+/* ------------------------------------------------------------------ */
+/* 内部类型：api.ts 的私有响应类型在此声明结构等价版本（快照即后端原样 JSON） */
+
+type RuntimeModel = {
+  baseUrl: string
+  model: string
+  connected: boolean
+  hasApiKey?: boolean
+  availableModels?: string[]
+}
+
+type CourseApiResponse = {
+  id: string
+  name: string
+  exam_date: string
+  target_score: number
+  daily_hours: number
+  progress: number
+}
+
+type ArchiveItemApiResponse = {
+  id: string
+  item_type: ArchiveItem['itemType']
+  entity_id: string
+  title: string
+  course_id?: string | null
+  course_name?: string | null
+  deleted_at: string
+  purge_after: string
+}
+
+type CourseMindMapApiResponse = {
+  status: 'ready' | 'empty'
+  courseId: string
+  mindMap: CourseMindMap | null
+}
+
+type ApiSurface = typeof import('../api')
+
+/* ------------------------------------------------------------------ */
+/* 快照结构（backend/scripts/export_demo_snapshot.py 产出） */
+
+type DemoSnapshot = {
+  exportedAt: string
+  courses: CourseApiResponse[]
+  workspaces: Record<string, StudyWorkspace>
+  mindMaps: Record<string, CourseMindMapApiResponse>
+  strategyDocuments: Record<string, StrategyDocuments>
+  knowledgeStatus: Record<string, KnowledgeBaseStatus>
+  materialPreviews: Record<string, Record<string, MaterialPreview>>
+  archive: ArchiveItemApiResponse[]
+  runtimeModel: RuntimeModel
+  userProfile: UserProfilePrompt
+  embeddingProfile: EmbeddingProfile
+  mcpServers: McpServer[]
+}
+
+/* ------------------------------------------------------------------ */
+/* 内存 store */
+
+let snapshot: DemoSnapshot | null = null
+let snapshotPromise: Promise<DemoSnapshot> | null = null
+
+function loadSnapshot(): Promise<DemoSnapshot> {
+  if (snapshot) return Promise.resolve(snapshot)
+  if (snapshotPromise) return snapshotPromise
+  snapshotPromise = fetch('/demo/snapshot.json')
+    .then((response) => {
+      if (!response.ok) throw new Error('演示数据快照加载失败')
+      return response.json() as Promise<DemoSnapshot>
+    })
+    .then((data) => {
+      snapshot = normalizeSnapshot(data)
+      return snapshot
+    })
+  return snapshotPromise
+}
+
+/** 让每门课的"考试日期"永远在未来：以最早考试日为锚点，把整体平移到访问日之后。 */
+function normalizeSnapshot(data: DemoSnapshot): DemoSnapshot {
+  const anchor = data.courses.reduce<string | null>((earliest, course) => {
+    const examDate = course.exam_date
+    return !earliest || examDate < earliest ? examDate : earliest
+  }, null)
+  if (!anchor) return data
+
+  const today = new Date()
+  const anchorDate = new Date(`${anchor}T00:00:00`)
+  const daysToShift = Math.max(0, Math.ceil((today.getTime() - anchorDate.getTime()) / 86_400_000) + 3)
+  if (daysToShift === 0) return data
+
+  const shift = (isoDate: string) => {
+    if (!isoDate) return isoDate
+    const date = new Date(`${isoDate.slice(0, 10)}T00:00:00`)
+    if (Number.isNaN(date.getTime())) return isoDate
+    date.setDate(date.getDate() + daysToShift)
+    return date.toISOString().slice(0, 10)
+  }
+
+  data.courses = data.courses.map((course) => ({ ...course, exam_date: shift(course.exam_date) }))
+  for (const courseId of Object.keys(data.workspaces)) {
+    const workspace = data.workspaces[courseId]
+    workspace.course = { ...workspace.course, examDate: shift(workspace.course.examDate) }
+    if (workspace.planStartDate) workspace.planStartDate = shift(workspace.planStartDate)
+    if (workspace.onboarding) workspace.onboarding = { ...workspace.onboarding, examDate: shift(workspace.onboarding.examDate) }
+    if (workspace.tasks) {
+      workspace.tasks = workspace.tasks.map((task) => ({ ...task, courseId }))
+    }
+  }
+  return data
+}
+
+function requireSnapshot(): DemoSnapshot {
+  if (!snapshot) throw new Error('演示数据尚未加载')
+  return snapshot
+}
+
+function workspaceOf(courseId: string): StudyWorkspace {
+  const workspace = requireSnapshot().workspaces[courseId]
+  if (!workspace) throw new Error('演示课程不存在')
+  return workspace
+}
+
+/* 日期工具（后端 build_daily_progress 的 TS 复刻） */
+
+function toIsoDate(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function buildDailyProgress(workspace: StudyWorkspace, today = new Date()): DailyProgress {
+  const tasks = workspace.tasks ?? []
+  const maxDay = tasks.reduce((max, task) => Math.max(max, task.day ?? 0), 1)
+  let todayDay = 1
+  if (workspace.planStartDate) {
+    const startDate = new Date(`${workspace.planStartDate.slice(0, 10)}T00:00:00`)
+    if (!Number.isNaN(startDate.getTime())) {
+      todayDay = Math.max(1, Math.min(maxDay, Math.floor((today.getTime() - startDate.getTime()) / 86_400_000) + 1))
+    }
+  }
+  const todayIso = toIsoDate(today)
+  const plannedToday = tasks
+    .filter((task) => (task.day ?? 0) === todayDay)
+    .reduce((sum, task) => sum + task.duration, 0)
+  const spentToday = (workspace.timeLog ?? [])
+    .filter((entry) => entry.date === todayIso)
+    .reduce((sum, entry) => sum + entry.minutes, 0)
+  const overdue = tasks
+    .filter((task) => (task.day ?? 0) < todayDay && task.status !== 'completed')
+    .map((task) => ({
+      id: task.id,
+      title: task.title,
+      day: task.day ?? 0,
+      duration: task.duration,
+      priority: task.priority,
+      status: task.status,
+    }))
+  return {
+    date: todayIso,
+    todayDay,
+    maxDay,
+    plannedToday,
+    spentToday,
+    remaining: Math.max(0, plannedToday - spentToday),
+    overBudget: plannedToday > 0 && spentToday > plannedToday,
+    overdue,
+  }
+}
+
+/** 每次返回 workspace 前重算 dailyProgress，保证演示日期新鲜。 */
+function withFreshProgress(workspace: StudyWorkspace): StudyWorkspace {
+  return { ...workspace, dailyProgress: buildDailyProgress(workspace) }
+}
+
+function inferCourseIcon(name: string): Course['icon'] {
+  const normalizedName = name.toLowerCase()
+  if (name.includes('英语') || normalizedName.includes('english')) return 'english'
+  if (name.includes('物理') || normalizedName.includes('physics')) return 'physics'
+  if (name.includes('数据库') || normalizedName.includes('database')) return 'database'
+  if (name.includes('数据结构') || name.includes('程序') || normalizedName.includes('code')) return 'code'
+  if (name.includes('数学') || name.includes('概率') || name.includes('经济') || normalizedName.includes('math')) return 'math'
+  return 'system'
+}
+
+function resolveCourseColor(courseId: string) {
+  const palette = ['#ff537f', '#3973e8', '#16a7a5', '#ff8a3d', '#a94cc6', '#2f65d8']
+  const hash = Array.from(courseId).reduce((sum, char) => sum + char.charCodeAt(0), 0)
+  return palette[hash % palette.length]
+}
+
+function toCourse(course: CourseApiResponse): Course {
+  return {
+    id: course.id,
+    name: course.name,
+    examDate: course.exam_date,
+    targetScore: course.target_score,
+    dailyHours: course.daily_hours,
+    progress: course.progress,
+    color: resolveCourseColor(course.id),
+    icon: inferCourseIcon(course.name),
+  }
+}
+
+function toArchiveItem(item: ArchiveItemApiResponse): ArchiveItem {
+  return {
+    id: item.id,
+    itemType: item.item_type,
+    entityId: item.entity_id,
+    title: item.title,
+    courseId: item.course_id ?? undefined,
+    courseName: item.course_name ?? undefined,
+    deletedAt: item.deleted_at,
+    purgeAfter: item.purge_after,
+  }
+}
+
+/** 深拷贝 + dailyProgress 重算 + course 装饰字段补全。 */
+function decoratedWorkspace(courseId: string): StudyWorkspace {
+  const raw = JSON.parse(JSON.stringify(workspaceOf(courseId))) as StudyWorkspace
+  raw.course = {
+    ...raw.course,
+    color: raw.course.color || resolveCourseColor(raw.course.id),
+    icon: raw.course.icon || inferCourseIcon(raw.course.name),
+  }
+  return withFreshProgress(raw)
+}
+
+function nowIso(): string {
+  return new Date().toISOString().slice(0, 19)
+}
+
+function daysUntil(examDate: string): number {
+  const exam = new Date(`${examDate.slice(0, 10)}T00:00:00`)
+  if (Number.isNaN(exam.getTime())) return 0
+  const today = new Date()
+  return Math.ceil((exam.getTime() - new Date(toIsoDate(today)).getTime()) / 86_400_000)
+}
+
+/* ------------------------------------------------------------------ */
+/* 变更辅助 */
+
+function replaceWorkspace(courseId: string, workspace: StudyWorkspace): StudyWorkspace {
+  requireSnapshot().workspaces[courseId] = JSON.parse(JSON.stringify(workspace)) as StudyWorkspace
+  return decoratedWorkspace(courseId)
+}
+
+function recomputeCourseProgress(workspace: StudyWorkspace): number {
+  if (!workspace.tasks.length) return workspace.course.progress
+  return Math.round(workspace.tasks.reduce((sum, task) => sum + task.progress, 0) / workspace.tasks.length)
+}
+
+function bumpMastery(workspace: StudyWorkspace, knowledgePointId: string, delta: number): void {
+  const point = workspace.knowledgePoints.find((kp) => kp.id === knowledgePointId)
+  if (!point) return
+  point.mastery = Math.max(0, Math.min(100, point.mastery + delta))
+}
+
+function appendMessages(workspace: StudyWorkspace, userMessage: string, reply: string, mode: 'chat' | 'agent'): void {
+  const stamp = Date.now()
+  const messages: StudyMessage[] = [
+    { id: `user-${stamp}`, role: 'user', mode, content: userMessage, createdAt: '刚刚' },
+    { id: `assistant-${stamp + 1}`, role: 'assistant', mode, content: reply, createdAt: '刚刚' },
+  ]
+  workspace.messages = [...(workspace.messages ?? []), ...messages]
+}
+
+function scriptStats(workspace: StudyWorkspace) {
+  const progress = workspace.tasks.length
+    ? Math.round(workspace.tasks.reduce((sum, task) => sum + task.progress, 0) / workspace.tasks.length)
+    : workspace.course.progress
+  const mastery = workspace.knowledgePoints.length
+    ? Math.round(workspace.knowledgePoints.reduce((sum, kp) => sum + kp.mastery, 0) / workspace.knowledgePoints.length)
+    : 50
+  const daily = workspace.dailyProgress ?? buildDailyProgress(workspace)
+  return {
+    course: workspace.course.name,
+    progress,
+    daysLeft: daysUntil(workspace.course.examDate),
+    mastery,
+    todayDay: daily.todayDay,
+    maxDay: daily.maxDay,
+    plannedToday: daily.plannedToday,
+    spentToday: daily.spentToday,
+    remaining: daily.remaining,
+    overdueCount: daily.overdue.length,
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 任务进度联动（对齐后端：完成任务时推进对应知识点掌握度与课程进度） */
+
+function applyTaskStatusSideEffects(workspace: StudyWorkspace, taskId: string, nextStatus: PlanTask['status']): void {
+  const task = workspace.tasks.find((item) => item.id === taskId)
+  if (!task) return
+  const wasCompleted = task.status === 'completed'
+  task.status = nextStatus
+  task.progress = nextStatus === 'completed' ? 100 : nextStatus === 'in-progress' ? Math.max(task.progress, 5) : 0
+  if (task.knowledgePointId) {
+    if (nextStatus === 'completed' && !wasCompleted) bumpMastery(workspace, task.knowledgePointId, 10)
+    if (nextStatus !== 'completed' && wasCompleted) bumpMastery(workspace, task.knowledgePointId, -10)
+  }
+  workspace.course.progress = recomputeCourseProgress(workspace)
+}
+
+/* ------------------------------------------------------------------ */
+/* demoApi 实现 */
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+const demoApi: ApiSurface = {
+  /* ---------------- 课程 ---------------- */
+
+  async listCourses() {
+    const data = await loadSnapshot()
+    return data.courses.map(toCourse)
+  },
+
+  async createCourse(payload) {
+    const data = await loadSnapshot()
+    const courseId = `course-demo-${Date.now()}`
+    const course: CourseApiResponse = {
+      id: courseId,
+      name: payload.name,
+      exam_date: payload.examDate,
+      target_score: payload.targetScore,
+      daily_hours: payload.dailyHours,
+      progress: 0,
+    }
+    data.courses.push(course)
+    // 新课程即时产出兜底 workspace（对齐 App.createLocalCourseWorkspace 的结构）
+    data.workspaces[courseId] = {
+      course: toCourse(course),
+      assessmentProfile: {
+        summary: `${payload.name}课程已创建（演示）。`,
+        questionTypes: ['待整理'],
+      },
+      diagnostic: { estimatedScore: '未摸底', message: '演示模式下暂不支持完整的初始化流程。' },
+      knowledgePoints: [],
+      tasks: [],
+      practiceQuestions: [],
+      mockQuestions: [],
+      materials: [],
+      wrongAnswers: [],
+      note: `## ${payload.name}考前笔记\n\n- 演示模式下新课程仅展示框架。`,
+      messages: [
+        {
+          id: `${courseId}-welcome`,
+          role: 'assistant',
+          content: `${payload.name}课程已加入（演示模式）。完整版会在此时导入资料、摸底并生成复习主线。`,
+          createdAt: '刚刚',
+        },
+      ],
+      generatedAt: nowIso(),
+      generationMode: 'fallback',
+    }
+    return toCourse(course)
+  },
+
+  async deleteCourse(courseId) {
+    const data = await loadSnapshot()
+    const index = data.courses.findIndex((course) => course.id === courseId)
+    if (index === -1) throw new Error('课程不存在')
+    const [removed] = data.courses.splice(index, 1)
+    delete data.workspaces[courseId]
+    delete data.mindMaps[courseId]
+    delete data.strategyDocuments[courseId]
+    delete data.knowledgeStatus[courseId]
+    delete data.materialPreviews[courseId]
+    const archiveItem: ArchiveItemApiResponse = {
+      id: `archive-demo-${Date.now()}`,
+      item_type: 'course',
+      entity_id: removed.id,
+      title: removed.name,
+      course_id: removed.id,
+      course_name: removed.name,
+      deleted_at: nowIso(),
+      purge_after: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+    }
+    data.archive.push(archiveItem)
+    return toArchiveItem(archiveItem)
+  },
+
+  async getCourseWorkspace(courseId) {
+    await loadSnapshot()
+    return decoratedWorkspace(courseId)
+  },
+
+  async getCourseMindMap(courseId) {
+    const data = await loadSnapshot()
+    return data.mindMaps[courseId] ?? { status: 'empty', courseId, mindMap: null }
+  },
+
+  async generateCourseMindMap(courseId) {
+    await delay(1200)
+    const data = await loadSnapshot()
+    return data.mindMaps[courseId] ?? { status: 'empty', courseId, mindMap: null }
+  },
+
+  async regroupCourseMindMapModules(courseId) {
+    await delay(600)
+    const data = await loadSnapshot()
+    return data.mindMaps[courseId] ?? { status: 'empty', courseId, mindMap: null }
+  },
+
+  async saveCourseMindMap(courseId, mindMap) {
+    const data = await loadSnapshot()
+    const current = data.mindMaps[courseId] ?? { status: 'ready' as const, courseId, mindMap: null }
+    data.mindMaps[courseId] = { ...current, mindMap }
+    return data.mindMaps[courseId]
+  },
+
+  /* ---------------- 搜索（复刻 main.py search_course 的 AND 匹配） ---------------- */
+
+  async searchCourse(courseId, query) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
+    if (!terms.length) return []
+    const matches = (...values: unknown[]) => {
+      const text = values.filter((value) => value != null).join(' ').toLowerCase()
+      return terms.every((term) => text.includes(term))
+    }
+    const results: SearchResult[] = []
+    const seen = new Set<string>()
+    const addResult = (
+      id: string,
+      type: SearchResult['type'],
+      module: SearchResult['module'],
+      title: string,
+      excerpt: string,
+      source = '',
+    ) => {
+      if (seen.has(id) || results.length >= 30) return
+      seen.add(id)
+      results.push({ id, type, module, title, excerpt: excerpt.trim().slice(0, 240), source })
+    }
+
+    for (const material of workspace.materials) {
+      if (matches(material.name, material.detail)) {
+        addResult(`material-${material.relativePath}`, 'material', 'materials', material.name, material.detail)
+      }
+    }
+    for (const point of workspace.knowledgePoints) {
+      if (matches(point.name, point.summary, point.source)) {
+        addResult(`knowledge-${point.id}`, 'knowledge', 'overview', point.name, point.summary, point.source)
+      }
+    }
+    if (matches(workspace.note)) {
+      addResult('course-note', 'note', 'notes', '课程复习笔记', workspace.note)
+    }
+    for (const wrongAnswer of workspace.wrongAnswers) {
+      if (matches(wrongAnswer.title, wrongAnswer.tag, wrongAnswer.mistakeType, wrongAnswer.source)) {
+        addResult(`wrong-answer-${wrongAnswer.id}`, 'wrong-answer', 'errors', wrongAnswer.title, wrongAnswer.mistakeType, wrongAnswer.source ?? wrongAnswer.tag)
+      }
+    }
+    const questionGroups: Array<[PlanTask[] | undefined, Array<{ id: string; prompt: string; explanation: string; source?: string; options: string[] }>, SearchResult['module']]> = [
+      [undefined, workspace.practiceQuestions, 'practice'],
+      [undefined, workspace.mockQuestions, 'mock'],
+      [undefined, workspace.diagnosticQuestions ?? [], 'overview'],
+    ]
+    for (const [, questions, module] of questionGroups) {
+      for (const question of questions) {
+        if (matches(question.prompt, question.explanation, question.source, ...question.options)) {
+          addResult(`question-${question.id}`, 'question', module, question.prompt, question.explanation, question.source ?? '')
+        }
+      }
+    }
+    return results
+  },
+
+  /* ---------------- 设置 / 摸底 / 策略文档 ---------------- */
+
+  async saveCourseSetup(courseId, payload) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    workspace.course = { ...workspace.course, name: payload.courseName, examDate: payload.examDate, targetScore: payload.targetScore, dailyHours: payload.dailyHours }
+    workspace.onboarding = workspace.onboarding
+      ? { ...workspace.onboarding, ...payload }
+      : undefined
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  async submitCourseDiagnostic(courseId, answers) {
+    await delay(800)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    if (workspace.diagnosticQuestions?.length) {
+      let score = 0
+      let total = 0
+      for (const question of workspace.diagnosticQuestions) {
+        total += 1
+        if (answers[question.id] === question.answerIndex) score += 1
+      }
+      if (workspace.onboarding) {
+        workspace.onboarding.diagnosticScore = score
+        workspace.onboarding.diagnosticTotal = total
+        workspace.onboarding.diagnosticPercent = total ? Math.round((score / total) * 100) : 0
+      }
+      workspace.diagnostic = {
+        estimatedScore: `${Math.round((score / Math.max(1, total)) * 100)} 分`,
+        message: '演示模式：已根据摸底结果更新预估。',
+      }
+    }
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  async getStrategyDocuments(courseId) {
+    const data = await loadSnapshot()
+    return data.strategyDocuments[courseId]
+  },
+
+  async generateStrategyDocuments(courseId) {
+    await delay(1500)
+    const data = await loadSnapshot()
+    return data.strategyDocuments[courseId]
+  },
+
+  async saveStrategyDocuments(courseId, payload) {
+    const data = await loadSnapshot()
+    const current = data.strategyDocuments[courseId]
+    if (current) {
+      data.strategyDocuments[courseId] = {
+        ...current,
+        reviewPlan: { ...current.reviewPlan, content: payload.reviewPlan, version: payload.reviewPlanVersion, updatedBy: 'user', updatedAt: nowIso() },
+        coursePrompt: { ...current.coursePrompt, content: payload.coursePrompt, version: payload.coursePromptVersion, updatedBy: 'user', updatedAt: nowIso() },
+      }
+    }
+    return data.strategyDocuments[courseId]
+  },
+
+  async approveStrategyDocuments(courseId) {
+    await delay(1000)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    if (workspace.strategyDocuments) workspace.strategyDocuments.status = 'approved'
+    if (workspace.onboarding) workspace.onboarding.status = 'planned'
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  async approveStrategyDocumentsInBackground(courseId) {
+    await loadSnapshot()
+    return { jobId: registerJob(courseId), courseId }
+  },
+
+  async getAgentJob(jobId) {
+    return getJob(jobId)
+  },
+
+  async saveCoursePrompt(courseId, coursePrompt, version) {
+    const data = await loadSnapshot()
+    const current = data.strategyDocuments[courseId]
+    if (current) {
+      data.strategyDocuments[courseId] = {
+        ...current,
+        coursePrompt: { ...current.coursePrompt, content: coursePrompt, version, updatedBy: 'user', updatedAt: nowIso() },
+      }
+    }
+    return data.strategyDocuments[courseId]
+  },
+
+  /* ---------------- 材料 ---------------- */
+
+  async getCourseMaterialPreview(courseId, relativePath) {
+    const data = await loadSnapshot()
+    const preview = data.materialPreviews[courseId]?.[relativePath]
+    if (!preview) throw new Error('演示模式下该材料不可预览。')
+    return preview
+  },
+
+  getCourseMaterialFileUrl() {
+    return '#'
+  },
+
+  getCourseMaterialConvertedFileUrl() {
+    return '#'
+  },
+
+  async rescanCourseMaterials(courseId) {
+    await delay(600)
+    await loadSnapshot()
+    return decoratedWorkspace(courseId)
+  },
+
+  async uploadCourseMaterials(courseId, files) {
+    await delay(900)
+    const fileArray = Array.from(files)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    for (const file of fileArray) {
+      workspace.materials.push({
+        name: file.name,
+        relativePath: file.name,
+        type: (file.name.split('.').pop() ?? 'FILE').toUpperCase(),
+        size: file.size,
+        detail: `${file.type || 'application/octet-stream'} · ${(file.size / 1024).toFixed(1)} KB · 演示模式占位`,
+        previewStatus: 'unsupported',
+        previewLabel: '演示模式',
+        previewMessage: '演示站不保存上传的文件，仅展示导入流程。',
+      })
+    }
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  async deleteCourseMaterial(courseId, relativePath) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    workspace.materials = workspace.materials.filter((material) => material.relativePath !== relativePath)
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  /* ---------------- 模型 / 画像 / 知识库 ---------------- */
+
+  async getRuntimeModel() {
+    const data = await loadSnapshot()
+    return data.runtimeModel
+  },
+
+  async saveRuntimeModel(payload) {
+    const data = await loadSnapshot()
+    data.runtimeModel = { ...data.runtimeModel, baseUrl: payload.baseUrl, model: payload.model, connected: true, hasApiKey: payload.apiKey.length > 0 }
+    return data.runtimeModel
+  },
+
+  async getUserProfilePrompt() {
+    const data = await loadSnapshot()
+    return data.userProfile
+  },
+
+  async saveUserProfilePrompt(content) {
+    const data = await loadSnapshot()
+    data.userProfile = { content, updatedAt: nowIso() }
+    return data.userProfile
+  },
+
+  async getEmbeddingProfile() {
+    const data = await loadSnapshot()
+    return data.embeddingProfile
+  },
+
+  async saveEmbeddingProfile(payload) {
+    const data = await loadSnapshot()
+    data.embeddingProfile = { ...data.embeddingProfile, ...payload }
+    return data.embeddingProfile
+  },
+
+  async testEmbeddingProfile() {
+    await delay(800)
+    const data = await loadSnapshot()
+    return { ...data.embeddingProfile, success: true }
+  },
+
+  async rebuildKnowledgeEmbeddings(_courseId) {
+    await delay(1200)
+    const data = await loadSnapshot()
+    return data.embeddingProfile
+  },
+
+  async getKnowledgeBaseStatus(courseId) {
+    const data = await loadSnapshot()
+    return data.knowledgeStatus[courseId] ?? {
+      courseId,
+      materials: 0,
+      chunks: 0,
+      chatTurns: 0,
+      learningEvents: 0,
+      memories: 0,
+      embedding: data.embeddingProfile,
+    }
+  },
+
+  /* ---------------- 作答 ---------------- */
+
+  async submitCoursePracticeAnswer(courseId, questionId, answerIndex, mode) {
+    await delay(500)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const question = workspace.practiceQuestions.find((item) => item.id === questionId)
+    if (!question) throw new Error('题目不存在')
+    const correct = question.answerIndex === answerIndex
+    bumpMastery(workspace, question.knowledgePointId, correct ? 8 : -5)
+    const mastery = workspace.knowledgePoints.find((kp) => kp.id === question.knowledgePointId)?.mastery ?? 50
+    workspace.practiceAnswers = workspace.practiceAnswers ?? {}
+    workspace.practiceAnswers[questionId] = {
+      answerIndex,
+      correct,
+      explanation: question.explanation,
+      mastery,
+      answeredAt: nowIso(),
+      mode: mode ?? '刷题练习',
+    }
+    if (!correct) {
+      const existing = workspace.wrongAnswers.find((item) => item.questionId === questionId)
+      if (existing) {
+        existing.count += 1
+        existing.isReviewed = false
+      } else {
+        workspace.wrongAnswers.push({
+          id: `wrong-demo-${Date.now()}`,
+          questionId,
+          questionType: mode === '主线学习' ? '主线学习' : '刷题练习',
+          source: question.source,
+          title: question.prompt.slice(0, 60),
+          tag: workspace.knowledgePoints.find((kp) => kp.id === question.knowledgePointId)?.name ?? '未分类',
+          mistakeType: '概念混淆',
+          count: 1,
+          isReviewed: false,
+        })
+      }
+    }
+    return {
+      correct,
+      explanation: question.explanation,
+      mastery,
+      generatedSimilarCount: 0,
+      workspace: replaceWorkspace(courseId, workspace),
+    }
+  },
+
+  async submitCourseWrongAnswerRetry(courseId, wrongAnswerId, answerIndex) {
+    const workspace0 = await demoApi.getCourseWorkspace(courseId)
+    const wrongAnswer = workspace0.wrongAnswers.find((item) => item.id === wrongAnswerId)
+    if (!wrongAnswer?.questionId) throw new Error('错题不存在')
+    const result = await demoApi.submitCoursePracticeAnswer(courseId, wrongAnswer.questionId, answerIndex, '刷题练习')
+    if (result.correct) {
+      const workspace = result.workspace
+      const target = workspace.wrongAnswers.find((item) => item.id === wrongAnswerId)
+      if (target) {
+        target.isReviewed = true
+        target.reviewedAt = nowIso()
+      }
+      result.workspace = replaceWorkspace(courseId, workspace)
+    }
+    return result as PracticeAnswerResult
+  },
+
+  async submitCourseMockAnswers(courseId, answers) {
+    await delay(1200)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    let score = 0
+    let total = 0
+    const results = workspace.mockQuestions.map((question) => {
+      total += question.score
+      const submitted = answers[question.id]
+      const correct = submitted === question.answerIndex
+      if (correct) score += question.score
+      bumpMastery(workspace, question.knowledgePointId, correct ? 6 : -4)
+      return {
+        id: question.id,
+        correct,
+        earnedScore: correct ? question.score : 0,
+        explanation: question.explanation,
+        mastery: workspace.knowledgePoints.find((kp) => kp.id === question.knowledgePointId)?.mastery ?? 50,
+        generatedSimilarCount: 0,
+      }
+    })
+    workspace.mockResult = { submittedAt: nowIso(), score, total, answers, results }
+    if (!workspace.practiceAnswers) workspace.practiceAnswers = {}
+    for (const question of workspace.mockQuestions) {
+      const submitted = answers[question.id]
+      if (submitted === undefined) continue
+      const correct = submitted === question.answerIndex
+      workspace.practiceAnswers[question.id] = {
+        answerIndex: typeof submitted === 'number' ? submitted : -1,
+        correct,
+        explanation: question.explanation,
+        mastery: workspace.knowledgePoints.find((kp) => kp.id === question.knowledgePointId)?.mastery ?? 50,
+        answeredAt: nowIso(),
+        mode: '模拟卷',
+      }
+    }
+    return {
+      score,
+      total,
+      results,
+      workspace: replaceWorkspace(courseId, workspace),
+    } satisfies MockSubmitResult
+  },
+
+  async clearCoursePracticeAnswer(courseId, questionId) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    if (workspace.practiceAnswers) delete workspace.practiceAnswers[questionId]
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  async clearCourseMockResult(courseId) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    workspace.mockResult = null
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  /* ---------------- workspace 变更 ---------------- */
+
+  async updateCourseWorkspace(courseId, payload) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    if (payload.tasks) {
+      const previous = workspace.tasks
+      workspace.tasks = payload.tasks
+      for (const task of workspace.tasks) {
+        const before = previous.find((item) => item.id === task.id)
+        if (before && before.status !== task.status) {
+          applyTaskStatusSideEffects(workspace, task.id, task.status)
+        }
+      }
+      workspace.course.progress = recomputeCourseProgress(workspace)
+    }
+    if (payload.wrongAnswers) workspace.wrongAnswers = payload.wrongAnswers
+    if (payload.note !== undefined) workspace.note = payload.note
+    return replaceWorkspace(courseId, workspace)
+  },
+
+  flushCourseWorkspaceNote(): void {
+    // 演示模式笔记仅存内存；此处为页面卸载兜底，无需持久化。
+  },
+
+  async recordCourseTimeLog(courseId, payload) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const entry: TimeLogEntry = {
+      id: `log-${Date.now()}`,
+      taskId: payload.taskId ?? '',
+      date: payload.date ?? toIsoDate(new Date()),
+      minutes: payload.minutes,
+      note: payload.note ?? '',
+      createdAt: nowIso(),
+    }
+    workspace.timeLog = [...(workspace.timeLog ?? []), entry]
+    const updated = replaceWorkspace(courseId, workspace)
+    return { entry, dailyProgress: updated.dailyProgress! }
+  },
+
+  async deleteCourseTimeLog(courseId, entryId) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    workspace.timeLog = (workspace.timeLog ?? []).filter((entry) => entry.id !== entryId)
+    const updated = replaceWorkspace(courseId, workspace)
+    return { dailyProgress: updated.dailyProgress! }
+  },
+
+  /* ---------------- AI 伴学 ---------------- */
+
+  async askCourseAgent(courseId, message, mode) {
+    await delay(900)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const script = matchAgentScript(message, mode, workspace.course.name)
+    const reply = fillScriptPlaceholders(script.reply, scriptStats(workspace))
+    appendMessages(workspace, message, reply, mode)
+    let proposal: AdjustmentProposal | null = null
+    if (script.proposal) {
+      proposal = { ...script.proposal, courseId }
+      workspace.pendingProposals = [...(workspace.pendingProposals ?? []), proposal]
+    }
+    return {
+      reply,
+      workspace: replaceWorkspace(courseId, workspace),
+      proposal,
+      runId: `run-demo-${Date.now()}`,
+      sources: [],
+    }
+  },
+
+  streamCourseAgent(courseId, message, mode, handlers, _context) {
+    let cancelled = false
+    const timers: number[] = []
+    let step = 0
+
+    const schedule = (fn: () => void, ms: number) => {
+      const timer = window.setTimeout(() => {
+        if (cancelled) return
+        fn()
+      }, ms)
+      timers.push(timer)
+    }
+
+    void (async () => {
+      const workspace = await decoratedWorkspaceAsync(courseId).catch(() => null)
+      if (!workspace || cancelled) return
+      const script = matchAgentScript(message, mode, workspace.course.name)
+      const reply = fillScriptPlaceholders(script.reply, scriptStats(workspace))
+      const toolEvents = mode === 'agent' ? script.toolEvents : []
+      let elapsed = 300
+
+      if (toolEvents.length) {
+        schedule(() => handlers.onStep?.(++step), elapsed)
+        for (const event of toolEvents) {
+          elapsed += 350
+          const startAt = elapsed
+          schedule(() => handlers.onToolStart?.({ step: step, name: event.name, label: event.label }), startAt)
+          elapsed += 700
+          schedule(() => handlers.onToolEnd?.({ step: step, name: event.name, summary: event.summary }), elapsed)
+        }
+      }
+
+      // 按 2-4 字符为 chunk 模拟打字机
+      const chunks = reply.match(/[\s\S]{1,3}/g) ?? [reply]
+      let cursor = 0
+      for (const chunk of chunks) {
+        elapsed += 18 + Math.random() * 30
+        schedule(() => {
+          cursor += chunk.length
+          handlers.onToken(chunk)
+        }, elapsed)
+      }
+
+      elapsed += 200
+      schedule(() => {
+        if (cancelled) return
+        // 对齐后端：done 前把本轮消息追加进 workspace
+        const finalWorkspace = decoratedWorkspace(courseId)
+        appendMessages(finalWorkspace, message, reply, mode)
+        let proposal: AdjustmentProposal | null = null
+        if (script.proposal) {
+          proposal = { ...script.proposal, courseId }
+          finalWorkspace.pendingProposals = [...(finalWorkspace.pendingProposals ?? []), proposal]
+        }
+        handlers.onDone({
+          reply,
+          workspace: replaceWorkspace(courseId, finalWorkspace),
+          proposal,
+          runId: `run-demo-${Date.now()}`,
+          sources: [],
+        })
+      }, elapsed)
+    })()
+
+    return {
+      cancel: () => {
+        cancelled = true
+        for (const timer of timers) window.clearTimeout(timer)
+      },
+    }
+  },
+
+  /* ---------------- 提案 / 计划调整 ---------------- */
+
+  async applyCourseAdjustmentProposal(courseId, proposalId) {
+    await delay(600)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const pending = (workspace.pendingProposals ?? []).find((item) => item.id === proposalId)
+    if (!pending) throw new Error('提案不存在或已处理')
+    pending.status = 'applied'
+    if (pending.params?.dailyHours) workspace.course.dailyHours = pending.params.dailyHours
+    if (pending.params?.days) {
+      workspace.course.examDate = toIsoDate(new Date(Date.now() + pending.params.days * 86_400_000))
+    }
+    workspace.pendingProposals = (workspace.pendingProposals ?? []).map((item) => (item.id === proposalId ? pending : item))
+    return { workspace: replaceWorkspace(courseId, workspace), proposal: pending }
+  },
+
+  async dismissCourseAdjustmentProposal(courseId, proposalId) {
+    await delay(300)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const pending = (workspace.pendingProposals ?? []).find((item) => item.id === proposalId)
+    if (!pending) throw new Error('提案不存在或已处理')
+    pending.status = 'dismissed'
+    workspace.pendingProposals = (workspace.pendingProposals ?? []).map((item) => (item.id === proposalId ? pending : item))
+    replaceWorkspace(courseId, workspace)
+    return pending
+  },
+
+  async adjustCoursePlan(courseId, payload: PlanParamsAdjustRequest): Promise<PlanParamsAdjustResponse> {
+    await delay(700)
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    if (payload.examDate) workspace.course.examDate = payload.examDate
+    if (payload.dailyHours) workspace.course.dailyHours = payload.dailyHours
+    if (payload.days && workspace.onboarding) workspace.onboarding.days = payload.days
+    // 对齐后端两分支：仅改考试日期直接返回 workspace；改天数/时长返回提案
+    if (!payload.days && !payload.dailyHours) {
+      return { workspace: replaceWorkspace(courseId, workspace), proposal: null }
+    }
+    const proposal: AdjustmentProposal = {
+      id: `proposal-plan-${Date.now()}`,
+      courseId,
+      title: '计划参数调整',
+      reason: '你调整了复习天数或每日时长。',
+      impact: '任务将按新参数重新装包。',
+      status: 'pending',
+      params: payload,
+    }
+    return { workspace: null, proposal }
+  },
+
+  /* ---------------- MCP / 外部资料 ---------------- */
+
+  async listMcpServers() {
+    const data = await loadSnapshot()
+    return data.mcpServers
+  },
+
+  async saveMcpServer(payload) {
+    const data = await loadSnapshot()
+    const server: McpServer = {
+      id: payload.id || `mcp-demo-${Date.now()}`,
+      name: payload.name,
+      endpoint: payload.endpoint,
+      transport: payload.transport,
+      command: payload.command,
+      args: payload.args,
+      tools: [],
+      allowedTools: payload.allowedTools,
+    }
+    const index = data.mcpServers.findIndex((item) => item.id === server.id)
+    if (index === -1) data.mcpServers.push(server)
+    else data.mcpServers[index] = server
+    return server
+  },
+
+  async discoverMcpServer(serverId) {
+    await delay(1000)
+    const data = await loadSnapshot()
+    const server = data.mcpServers.find((item) => item.id === serverId)
+    if (!server) throw new Error('MCP 服务不存在')
+    return server
+  },
+
+  async submitCourseExternalSource(courseId, payload) {
+    await loadSnapshot()
+    const source: ExternalSource = {
+      id: `source-demo-${Date.now()}`,
+      courseId,
+      url: payload.url,
+      sourceType: payload.sourceType,
+      title: payload.url,
+      status: 'queued',
+      content: '',
+      metadata: { mcpServerId: payload.mcpServerId, toolName: payload.toolName },
+      error: '',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    }
+    externalSources.set(source.id, source)
+    // 异步推进抓取状态，对齐后端 queued → fetching → pending_review 流转
+    window.setTimeout(() => {
+      const current = externalSources.get(source.id)
+      if (current && current.status === 'queued') current.status = 'fetching'
+    }, 1500)
+    window.setTimeout(() => {
+      const current = externalSources.get(source.id)
+      if (current && current.status === 'fetching') {
+        current.status = 'pending_review'
+        current.title = '演示抓取的网页内容'
+        current.content = `# 演示抓取结果\n\n这是演示模式对外部资料 ${payload.url} 的模拟抓取结果。完整版会通过对应的 MCP 服务抓取真实内容，经你审核后导入资料库。\n\n## 要点\n\n- 演示模式不发出真实网络请求；\n- 审核通过后会以「外部资料」形式加入课程资料库。`
+      }
+    }, 3200)
+    return source
+  },
+
+  async getCourseExternalSource(courseId, sourceId) {
+    const source = externalSources.get(sourceId)
+    if (!source || source.courseId !== courseId) throw new Error('外部资料不存在')
+    return source
+  },
+
+  async approveCourseExternalSource(courseId, sourceId) {
+    await delay(400)
+    const source = externalSources.get(sourceId)
+    if (!source) throw new Error('外部资料不存在')
+    source.status = 'approved'
+    const workspace = decoratedWorkspace(courseId)
+    workspace.materials.push({
+      name: `外部资料-${source.title}.md`,
+      relativePath: `外部资料/${source.title}.md`,
+      type: 'MD',
+      size: source.content.length,
+      detail: `${(source.content.length / 1024).toFixed(1)} KB · 演示导入`,
+      previewStatus: 'ready',
+      previewLabel: '可预览',
+      previewMessage: '外部资料已导入（演示）。',
+    })
+    return { source: { ...source }, workspace: replaceWorkspace(courseId, workspace) }
+  },
+
+  async dismissCourseExternalSource(courseId, sourceId) {
+    const source = externalSources.get(sourceId)
+    if (!source || source.courseId !== courseId) throw new Error('外部资料不存在')
+    source.status = 'dismissed'
+    return { ...source }
+  },
+
+  async deleteCourseWrongAnswer(courseId, wrongAnswerId) {
+    await loadSnapshot()
+    const workspace = decoratedWorkspace(courseId)
+    const removed = workspace.wrongAnswers.find((item) => item.id === wrongAnswerId)
+    workspace.wrongAnswers = workspace.wrongAnswers.filter((item) => item.id !== wrongAnswerId)
+    const data = requireSnapshot()
+    const archiveItem: ArchiveItemApiResponse = {
+      id: `archive-demo-${Date.now()}`,
+      item_type: 'wrong-answer',
+      entity_id: wrongAnswerId,
+      title: removed?.title ?? '已删除错题',
+      course_id: courseId,
+      course_name: workspace.course.name,
+      deleted_at: nowIso(),
+      purge_after: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+    }
+    data.archive.push(archiveItem)
+    return {
+      workspace: replaceWorkspace(courseId, workspace),
+      archiveItem: toArchiveItem(archiveItem),
+    }
+  },
+
+  async listArchiveItems() {
+    const data = await loadSnapshot()
+    return data.archive.map(toArchiveItem)
+  },
+
+  async restoreArchiveItem(archiveId) {
+    const data = await loadSnapshot()
+    const index = data.archive.findIndex((item) => item.id === archiveId)
+    if (index === -1) throw new Error('归档内容不存在')
+    const [item] = data.archive.splice(index, 1)
+    if (item.item_type === 'course') {
+      const restored: CourseApiResponse = {
+        id: item.entity_id,
+        name: item.title,
+        exam_date: toIsoDate(new Date(Date.now() + 14 * 86_400_000)),
+        target_score: 85,
+        daily_hours: 3,
+        progress: 0,
+      }
+      data.courses.push(restored)
+      return { itemType: item.item_type, course: toCourse(restored), workspace: undefined, archiveItems: data.archive.map(toArchiveItem) }
+    }
+    const workspace = decoratedWorkspace(item.course_id ?? '')
+    workspace.wrongAnswers.push({
+      id: item.entity_id,
+      title: item.title,
+      tag: '已恢复',
+      mistakeType: '历史错题',
+      count: 1,
+      isReviewed: false,
+    })
+    return {
+      itemType: item.item_type,
+      course: undefined,
+      workspace: replaceWorkspace(item.course_id ?? '', workspace),
+      archiveItems: data.archive.map(toArchiveItem),
+    }
+  },
+
+  toRuntimeModelProfile(runtimeModel): ModelProfile {
+    return {
+      provider: 'custom',
+      baseUrl: runtimeModel.baseUrl,
+      model: runtimeModel.model,
+      apiKey: '',
+      hasApiKey: runtimeModel.hasApiKey,
+      availableModels: runtimeModel.availableModels,
+      supportsVision: true,
+      status: runtimeModel.connected ? 'connected' : 'unconfigured',
+      statusMessage: runtimeModel.connected ? '已由本机服务配置并连接' : '本机模型尚未配置',
+    }
+  },
+}
+
+async function decoratedWorkspaceAsync(courseId: string): Promise<StudyWorkspace> {
+  await loadSnapshot()
+  return decoratedWorkspace(courseId)
+}
+
+/* ------------------------------------------------------------------ */
+/* 演示 job 推进（approve-job → queued → running → completed） */
+
+type DemoJob = AgentJob & { startedAtMs: number }
+
+const jobs = new Map<string, DemoJob>()
+
+function registerJob(courseId: string): string {
+  const id = `job-demo-${Date.now()}`
+  jobs.set(id, {
+    id,
+    courseId,
+    jobType: 'strategy_documents_approve',
+    status: 'queued',
+    attempts: 1,
+    maxAttempts: 3,
+    error: '',
+    result: {},
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    startedAtMs: Date.now(),
+  })
+  return id
+}
+
+async function getJob(jobId: string): Promise<AgentJob> {
+  const job = jobs.get(jobId)
+  if (!job) throw new Error('任务不存在')
+  const elapsed = Date.now() - job.startedAtMs
+  if (job.status === 'completed') return { ...job }
+  if (elapsed > 6000) {
+    job.status = 'completed'
+    job.updatedAt = nowIso()
+  } else if (elapsed > 1200) {
+    job.status = 'running'
+    job.updatedAt = nowIso()
+  }
+  return { ...job }
+}
+
+/* 外部资料 store（不入快照） */
+const externalSources = new Map<string, ExternalSource>()
+
+export default demoApi

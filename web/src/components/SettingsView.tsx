@@ -30,7 +30,8 @@ import {
   saveUserProfilePrompt,
   testEmbeddingProfile,
   toRuntimeModelProfile,
-} from '../api'
+  isDemoMode,
+} from '../apiClient'
 import type {
   EmbeddingProfile,
   KnowledgeBaseStatus,
@@ -203,6 +204,14 @@ function resolveSelectedModel(currentModel: string, availableModels: string[]) {
 }
 
 async function requestAvailableModels(profile: ModelProfile) {
+  if (isDemoMode) {
+    // 演示模式不发出真实网络请求，返回预设模型列表
+    return {
+      success: true,
+      message: '演示模式：模型连接已模拟',
+      available_models: ['gpt-5.4', 'deepseek-v4', 'glm-5.1'],
+    } satisfies ConnectionResult
+  }
   const response = await fetch('http://127.0.0.1:8000/api/model-profiles/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { CalendarDays, ChevronLeft, ChevronRight, LoaderCircle, X } from 'lucide-react'
 import type { Course, StudyWorkspace } from '../types'
-import { getCourseWorkspace } from '../api'
+import { getCourseWorkspace } from '../apiClient'
 
 type PlanningViewProps = {
   courses: Course[]

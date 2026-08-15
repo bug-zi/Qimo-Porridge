@@ -53,7 +53,7 @@ import type {
   StudyWorkedExample,
   WrongAnswer,
 } from '../types'
-import { generateCourseMindMap, getCourseMindMap, regroupCourseMindMapModules, saveCourseMindMap } from '../api'
+import { generateCourseMindMap, getCourseMindMap, regroupCourseMindMapModules, saveCourseMindMap } from '../apiClient'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'

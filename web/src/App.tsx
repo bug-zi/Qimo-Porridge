@@ -63,7 +63,7 @@ import {
   updateCourseWorkspace,
   flushCourseWorkspaceNote,
   uploadCourseMaterials,
-} from './api'
+} from './apiClient'
 import { AiCompanion } from './components/AiCompanion'
 import { MainNavigation } from './components/Sidebar'
 import { OptionWheel } from './components/OptionWheel'
