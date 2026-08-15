@@ -5,6 +5,7 @@ import json
 import hashlib
 import mimetypes
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -25,16 +26,20 @@ from .agents import run_content_workflow, run_strategy_workflow, with_structured
 from .agents.tools import apply_operations_to_copy
 from .agents.tutor import run_tutor_agent, run_tutor_agent_stream
 from .agents.workflow import _shuffle_single_choice_options, _shuffle_single_choice_questions
+from . import study_scheduler
 from .knowledge_service import (
+    build_conversation_memory,
     get_knowledge_status,
     import_workspace_messages,
+    latest_summarized_turn_id,
     learner_memory_context,
-    recent_chat_messages,
+    record_chat_summary,
     record_chat_turn,
     record_learning_event,
     record_review_progress,
     retrieve_material_context,
     sync_material_documents,
+    unsummarized_chat_turns,
     upsert_learner_memory,
 )
 
@@ -79,10 +84,32 @@ _WORKSPACE_LOCKS_GUARD = threading.Lock()
 _CONTENT_GENERATION_LOCKS: dict[str, threading.Lock] = {}
 _CONTENT_GENERATION_LOCKS_GUARD = threading.Lock()
 MODEL_CONNECT_TIMEOUT_SECONDS = 20
-MODEL_REQUEST_TIMEOUT_SECONDS = 150
+# 单次模型请求超时。gpt-5.x 系列是推理模型，生成「多日复习计划」这类大结构化 JSON
+# 实测可达 ~160s（输出 8000+ token），150s 会把正常慢请求误杀成超时。
+# 取 300s 给最重的策略规划调用留足余量；正常请求仍会在数秒~数十秒内返回。
+MODEL_REQUEST_TIMEOUT_SECONDS = 300
 MODEL_MAX_ATTEMPTS = 3
 MODEL_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS = (20, 45)
+# 连接级瞬时错误（SSL EOF、连接重置、读超时）的专用重试预算。
+# 上游模型网关（如 token.aiedulab.cn）偶发掐断连接，单次重试往往即可恢复；
+# 策略生成等 Agent 工作流需串行多次模型调用，更薄的预算会让整条链在坏窗口里全挂。
+# 因此对这类“廉价的、可安全重试”的连接错误给更多次、带抖动的指数退避；
+# HTTP 错误仍按 MODEL_MAX_ATTEMPTS 退避，行为不变。
+MODEL_TRANSIENT_MAX_ATTEMPTS = 6
+MODEL_TRANSIENT_BACKOFF_BASE_SECONDS = 2.0
+MODEL_TRANSIENT_BACKOFF_CAP_SECONDS = 16.0
+
+
+def _transient_retry_delay(attempt: int) -> float:
+    """连接级瞬时错误的指数退避（含抖动），避免多请求同步重试压垮上游网关。"""
+    delay = min(MODEL_TRANSIENT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), MODEL_TRANSIENT_BACKOFF_CAP_SECONDS)
+    return delay + random.uniform(0, delay * 0.25)
+
+# 资料上传大小上限（字节）。默认单文件 512MB、单次批量 1GB；可用环境变量
+# MAX_SINGLE_MATERIAL_MB / MAX_BATCH_MATERIAL_MB 覆盖（单位 MB）。
+MAX_SINGLE_MATERIAL_BYTES = int(os.getenv("MAX_SINGLE_MATERIAL_MB", "512")) * 1024 * 1024
+MAX_BATCH_MATERIAL_BYTES = int(os.getenv("MAX_BATCH_MATERIAL_MB", "1024")) * 1024 * 1024
 
 
 def _review_days_from_exam_date(exam_date: Any, *, today: date | None = None) -> int | None:
@@ -95,6 +122,56 @@ def _review_days_from_exam_date(exam_date: Any, *, today: date | None = None) ->
         return None
     current_day = today or datetime.now().date()
     return min(30, max(1, (exam_day - current_day).days))
+
+
+def _review_session_days(days: int, review_count: int) -> list[int]:
+    """把「共复习 K 次」均匀落到「距考试 D 天」的日程上。
+
+    与前端 web/src/utils/reviewSchedule.ts 严格一致，改这里必须同步改前端。
+
+    - K <= 0 或缺省 → 按「每天」处理（等价于 1..D，向后兼容）。
+    - K == 1 → [1]（只复习一次，放在第 1 天）。
+    - K >= 2 → 第 j 次（j=0..K-1）落在 clamp(round(1 + j*(D-1)/(K-1)), 1, D)，去重保序。
+    - K > D 时钳制为 D（一天最多一次复习）。
+    """
+    span = max(1, int(days))
+    count = min(max(1, int(review_count)), span) if review_count and review_count > 0 else span
+    if count == 1:
+        return [1]
+    seen: set[int] = set()
+    result: list[int] = []
+    for j in range(count):
+        raw = 1 + (j * (span - 1)) / (count - 1)
+        # 用 int(raw + 0.5) 而非 round()：Python round 是银行家舍入，JS Math.round 是四舍五入，
+        # 两者在 .5 处会差一天（如 days=4,K=3）。前端 reviewSchedule.ts 用 Math.round，这里必须对齐。
+        day = max(1, min(span, int(raw + 0.5)))
+        if day not in seen:
+            seen.add(day)
+            result.append(day)
+    return result
+
+
+def _remap_tasks_to_review_sessions(tasks: list[dict[str, Any]], days: int, review_count: int) -> None:
+    """把任务的 day 从「按内容顺序的 1..N」重映射到「共复习 K 次」的复习日上。
+
+    仅当 0 < review_count < days 时启用（即用户显式调小复习频率）；其余情况（缺省/每天）
+    保持原 day 不变，完全向后兼容。AI 仍按自然顺序产出任务，这里按出现顺序合并到 K 个
+    复习日——重映射作为兜底，不依赖 AI 严格服从间隔指令。改这里需同步前端 reviewSchedule.ts。
+    """
+    if not tasks or days < 1 or not (0 < review_count < days):
+        return
+    session_days = _review_session_days(days, review_count)
+    if not session_days:
+        return
+    ai_days = sorted({int(t["day"]) for t in tasks if isinstance(t.get("day"), int)})
+    if not ai_days:
+        return
+    day_map = {
+        ai_day: session_days[min(i, len(session_days) - 1)]
+        for i, ai_day in enumerate(ai_days)
+    }
+    for task in tasks:
+        task["day"] = day_map.get(int(task.get("day", 1)), session_days[0])
 
 
 def _validate_course_id(course_id: str) -> str:
@@ -258,12 +335,28 @@ def get_runtime_model_api_key() -> str:
 def save_runtime_model_profile(base_url: str, api_key: str, model: str) -> dict[str, str | bool | list[str]]:
     config = _read_runtime_env()
     next_api_key = api_key.strip() or config["EXAM_BOOSTER_MODEL_API_KEY"]
+    model_keys = {
+        "EXAM_BOOSTER_MODEL_BASE_URL",
+        "EXAM_BOOSTER_MODEL_API_KEY",
+        "EXAM_BOOSTER_MODEL_NAME",
+    }
+    preserved_lines: list[str] = []
+    if RUNTIME_ENV_PATH.exists():
+        for line in RUNTIME_ENV_PATH.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                preserved_lines.append(line)
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key not in model_keys:
+                preserved_lines.append(line)
     RUNTIME_ENV_PATH.write_text(
         "\n".join(
             [
                 f"EXAM_BOOSTER_MODEL_BASE_URL={base_url.strip().rstrip('/')}",
                 f"EXAM_BOOSTER_MODEL_API_KEY={next_api_key}",
                 f"EXAM_BOOSTER_MODEL_NAME={model.strip()}",
+                *preserved_lines,
             ]
         )
         + "\n",
@@ -329,8 +422,9 @@ def fetch_available_model_ids(base_url: str, api_key: str) -> list[str]:
 
 def _request_model_json(request: Request, operation: str) -> dict[str, Any]:
     last_error: Exception | None = None
-    for attempt in range(1, MODEL_MAX_ATTEMPTS + 1):
-        retry_delay = 2 ** (attempt - 1)
+    http_attempts = 0
+    for attempt in range(1, MODEL_TRANSIENT_MAX_ATTEMPTS + 1):
+        retry_delay = 0.0
         try:
             with urlopen(request, timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as response:
                 data = json.loads(response.read().decode("utf-8"))
@@ -339,19 +433,23 @@ def _request_model_json(request: Request, operation: str) -> dict[str, Any]:
             return data
         except HTTPError as error:
             last_error = error
-            if error.code not in MODEL_RETRYABLE_HTTP_CODES or attempt == MODEL_MAX_ATTEMPTS:
-                raise RuntimeError(f"{operation}连续 {attempt} 次返回 HTTP {error.code}") from error
+            http_attempts += 1
+            if error.code not in MODEL_RETRYABLE_HTTP_CODES or http_attempts >= MODEL_MAX_ATTEMPTS:
+                raise RuntimeError(f"{operation}连续 {http_attempts} 次返回 HTTP {error.code}") from error
+            retry_delay = 2 ** (http_attempts - 1)
             if error.code == 429:
                 retry_after = error.headers.get("Retry-After")
                 retry_delay = (
                     int(retry_after)
                     if retry_after and retry_after.isdigit()
-                    else MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS[min(attempt - 1, len(MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1)]
+                    else MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS[min(http_attempts - 1, len(MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1)]
                 )
         except (URLError, TimeoutError, OSError) as error:
             last_error = error
-            if attempt == MODEL_MAX_ATTEMPTS:
+            # 连接级瞬时错误（SSL EOF/重置/超时）单独给更激进的重试预算，熬过网关坏窗口。
+            if attempt >= MODEL_TRANSIENT_MAX_ATTEMPTS:
                 raise RuntimeError(f"{operation}连接失败或响应超时") from error
+            retry_delay = _transient_retry_delay(attempt)
         except ValueError as error:
             raise RuntimeError(f"{operation}返回内容无法解析") from error
         time.sleep(retry_delay)
@@ -463,30 +561,35 @@ def _model_agent_turn(messages: list[dict[str, Any]], tools: list[dict[str, Any]
 def _open_model_stream(request: Request, operation: str):
     """建立到模型服务的流式连接。
 
-    仅在“连接建立”阶段重试（沿用 _request_model_json 的退避策略）；
+    仅在“连接建立”阶段重试；连接级瞬时错误按 MODEL_TRANSIENT_MAX_ATTEMPTS 退避
+    （更多次、带抖动），HTTP 错误仍按 MODEL_MAX_ATTEMPTS 退避。
     一旦 urlopen 成功返回 response，即进入“读流”阶段，不再重试——
     流中途断开交由调用方按 error 事件处理。
     """
     last_error: Exception | None = None
-    for attempt in range(1, MODEL_MAX_ATTEMPTS + 1):
-        retry_delay = 2 ** (attempt - 1)
+    http_attempts = 0
+    for attempt in range(1, MODEL_TRANSIENT_MAX_ATTEMPTS + 1):
+        retry_delay = 0.0
         try:
             return urlopen(request, timeout=MODEL_REQUEST_TIMEOUT_SECONDS)
         except HTTPError as error:
             last_error = error
-            if error.code not in MODEL_RETRYABLE_HTTP_CODES or attempt == MODEL_MAX_ATTEMPTS:
-                raise RuntimeError(f"{operation}连续 {attempt} 次返回 HTTP {error.code}") from error
+            http_attempts += 1
+            if error.code not in MODEL_RETRYABLE_HTTP_CODES or http_attempts >= MODEL_MAX_ATTEMPTS:
+                raise RuntimeError(f"{operation}连续 {http_attempts} 次返回 HTTP {error.code}") from error
+            retry_delay = 2 ** (http_attempts - 1)
             if error.code == 429:
                 retry_after = error.headers.get("Retry-After")
                 retry_delay = (
                     int(retry_after)
                     if retry_after and retry_after.isdigit()
-                    else MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS[min(attempt - 1, len(MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1)]
+                    else MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS[min(http_attempts - 1, len(MODEL_RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1)]
                 )
         except (URLError, TimeoutError, OSError) as error:
             last_error = error
-            if attempt == MODEL_MAX_ATTEMPTS:
+            if attempt >= MODEL_TRANSIENT_MAX_ATTEMPTS:
                 raise RuntimeError(f"{operation}连接失败或响应超时") from error
+            retry_delay = _transient_retry_delay(attempt)
         time.sleep(retry_delay)
     raise RuntimeError(f"{operation}失败") from last_error
 
@@ -1457,8 +1560,8 @@ def upload_course_material(filename: str, content: bytes, course_id: str = DEFAU
     safe_name = _safe_upload_material_name(filename)
     if not content:
         raise ValueError("不能导入空文件")
-    if len(content) > 120 * 1024 * 1024:
-        raise ValueError("单个资料文件不能超过 120MB")
+    if len(content) > MAX_SINGLE_MATERIAL_BYTES:
+        raise ValueError(f"单个资料文件不能超过 {MAX_SINGLE_MATERIAL_BYTES // (1024 * 1024)}MB")
 
     course_directory = _course_material_directory(course_id)
     course_directory.mkdir(parents=True, exist_ok=True)
@@ -1481,8 +1584,8 @@ def upload_course_materials(
     if not files:
         raise ValueError("没有可导入的资料文件")
     total_size = sum(len(content) for _, content in files)
-    if total_size > 240 * 1024 * 1024:
-        raise ValueError("单次批量导入不能超过 240MB")
+    if total_size > MAX_BATCH_MATERIAL_BYTES:
+        raise ValueError(f"单次批量导入不能超过 {MAX_BATCH_MATERIAL_BYTES // (1024 * 1024)}MB")
 
     course_directory = _course_material_directory(course_id)
     course_directory.mkdir(parents=True, exist_ok=True)
@@ -1491,8 +1594,8 @@ def upload_course_materials(
         safe_name = _safe_upload_material_name(filename)
         if not content:
             raise ValueError(f"{safe_name} 是空文件，不能导入")
-        if len(content) > 120 * 1024 * 1024:
-            raise ValueError(f"{safe_name} 超过 120MB，不能导入")
+        if len(content) > MAX_SINGLE_MATERIAL_BYTES:
+            raise ValueError(f"{safe_name} 超过 {MAX_SINGLE_MATERIAL_BYTES // (1024 * 1024)}MB，不能导入")
 
         target_path = course_directory / safe_name
         if target_path.exists():
@@ -2666,6 +2769,7 @@ def _empty_course_workspace(
             "targetText": f"保证 {target_score} 分",
             "dailyHours": float(course_payload.get("dailyHours", 2)),
             "days": _review_days_from_exam_date(course_payload.get("examDate")) or 3,
+            "reviewCount": int(course_payload.get("reviewCount") or 0) or (_review_days_from_exam_date(course_payload.get("examDate")) or 3),
             "examFormat": "",
             "remarks": "",
             "createdAt": datetime.now().isoformat(timespec="seconds"),
@@ -2783,6 +2887,7 @@ def save_course_setup(
         "targetText": setup.get("target_text", ""),
         "dailyHours": setup["daily_hours"],
         "days": _review_days_from_exam_date(setup.get("exam_date")) or setup["days"],
+        "reviewCount": int(setup.get("review_count") or 0) or setup["days"],
         "examFormat": setup.get("exam_format", ""),
         "remarks": setup.get("remarks", ""),
         "updatedAt": datetime.now().isoformat(timespec="seconds"),
@@ -2816,6 +2921,42 @@ def save_course_setup(
     _mark_material_memory(workspace, materials, change_note="课程信息已保存，摸底题已生成")
     workspace["generatedAt"] = datetime.now().isoformat(timespec="seconds")
     workspace["generationMode"] = "ai"
+    save_workspace(workspace, course_id)
+    return workspace
+
+
+def update_course_plan_params(
+    course_id: str,
+    *,
+    exam_date: str | None = None,
+    days: int | None = None,
+    daily_hours: float | None = None,
+) -> dict[str, Any]:
+    """只更新考试日期 / 复习天数 / 每日复习时间，绝不清空 tasks/studyGuide/practice。
+
+    与 save_course_setup 的关键区别：不重置 onboarding.status、不重新生成摸底题、不动 tasks，
+    因此 save_workspace 不会递增 planRevision。供「计划生成后动态调整参数」使用。
+    """
+    workspace = load_workspace(course_id, refresh_materials=False)
+    onboarding = workspace.setdefault("onboarding", {})
+    course = workspace.setdefault("course", {})
+
+    if exam_date is not None:
+        if not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", str(exam_date).strip()):
+            raise ValueError("考试日期格式应为 YYYY-MM-DD")
+        course["examDate"] = exam_date
+        onboarding["examDate"] = exam_date
+    if daily_hours is not None:
+        if not 0 < daily_hours <= 12:
+            raise ValueError("每日复习时间必须在 0-12 小时之间")
+        course["dailyHours"] = daily_hours
+        onboarding["dailyHours"] = daily_hours
+    if days is not None:
+        if not 1 <= days <= 30:
+            raise ValueError("复习天数必须在 1-30 之间")
+        onboarding["days"] = days
+
+    onboarding["updatedAt"] = datetime.now().isoformat(timespec="seconds")
     save_workspace(workspace, course_id)
     return workspace
 
@@ -2919,7 +3060,7 @@ def _generate_strategy_documents_legacy(course_id: str = DEFAULT_COURSE_ID) -> d
    ## 检验标准
    ## 动态调整规则
    ## 当前进度快照
-2. 从用户设置读取复习天数 N 和每日可用小时数。`分阶段复习策略`必须逐一写出 `### 第1天：具体主题` 至 `### 第N天：具体主题`，不得合并、跳过、只写阶段名称或使用“后续几天同理”。即使 N 较大，也必须保留每天不同的知识点、训练任务和验收目标；篇幅不足时压缩背景说明，不得压缩逐日执行表。
+2. 从用户设置读取复习天数 N 和每日可用小时数。`分阶段复习策略`必须逐一写出 `### 第1天：具体主题` 至 `### 第N天：具体主题`，不得合并、跳过、只写阶段名称或使用“后续几天同理”。即使 N 较大，也必须保留每天不同的知识点、训练任务和验收目标；篇幅不足时压缩背景说明，不得压缩逐日执行表。若用户设置的「复习次数」(reviewCount) 小于复习天数 N，说明并非每天复习：仅在间隔分布的复习日安排完整学习内容，其余天标题写为「休息日（回顾/机动）」并简述用途，仍保留 N 个二级标题与序号，不得删除或合并。
 3. 每一天必须严格使用下面的完整结构，不得省略任何小节：
    - `#### 当日目标与安排思路`：写明当天要提升的具体能力，以及对应的摸底错题、掌握度、题型分值、考试频率、老师强调或前置依赖；
    - `#### 当日时间表`：给出 3-6 个按执行顺序排列的学习块。每个学习块明确分钟数、具体知识点、学习动作、练习题型、完成产出和验收标准；
@@ -3121,6 +3262,7 @@ def _sanitize_custom_workspace(candidate: dict[str, Any], base: dict[str, Any], 
         })
 
     points = [point for point in workspace.get("knowledgePoints", []) if isinstance(point, dict)]
+    scheduling_warnings = study_scheduler.sanitize_dependencies(points)
     point_by_id = {str(point.get("id", "")): point for point in points}
     member_count: dict[str, int] = {mid: 0 for mid in module_ids}
     for point in points:
@@ -3150,6 +3292,24 @@ def _sanitize_custom_workspace(candidate: dict[str, Any], base: dict[str, Any], 
                 or "讲义、例题和自测仍在后台生成中；稍后可重新生成复习主线继续补齐。"
             )
         normalized_tasks.append(task)
+    onboarding_cfg = workspace.get("onboarding") or {}
+    review_days = int(onboarding_cfg.get("days") or 0)
+    review_count = int(onboarding_cfg.get("reviewCount") or 0)
+    daily_minutes = round(float(onboarding_cfg.get("dailyHours") or 0) * 60) or 120
+    if study_scheduler.has_dependencies(points):
+        # 知识点带前置依赖：确定性调度器接管 day/order（拓扑序 + 按复习日时长装包）。
+        scheduling_warnings.extend(
+            study_scheduler.schedule_tasks(
+                normalized_tasks,
+                points,
+                session_days=_review_session_days(review_days, review_count),
+                daily_minutes=daily_minutes,
+                modules=workspace.get("modules") if isinstance(workspace.get("modules"), list) else None,
+            )
+        )
+    else:
+        _remap_tasks_to_review_sessions(normalized_tasks, review_days, review_count)
+    workspace["schedulingWarnings"] = scheduling_warnings
     workspace["tasks"] = normalized_tasks
 
     for question_key in ("practiceQuestions", "mockQuestions"):
@@ -3216,6 +3376,33 @@ def _write_content_plan_preview(
         normalized["priority"] = normalized.get("priority") if normalized.get("priority") in ("high", "medium", "low") else "medium"
         normalized["contentQualityWarning"] = "讲义、例题和自测仍在后台生成中"
         normalized_tasks.append(normalized)
+    onboarding_cfg = workspace.get("onboarding") or {}
+    preview_points = [
+        point
+        for point in workspace.get("knowledgePoints", [])
+        if isinstance(point, dict)
+    ]
+    preview_warnings = study_scheduler.sanitize_dependencies(preview_points)
+    if study_scheduler.has_dependencies(preview_points) and normalized_tasks:
+        # 骨架预览与最终清洗走同一调度器，保证预览期顺序 == 最终顺序。
+        preview_warnings.extend(
+            study_scheduler.schedule_tasks(
+                normalized_tasks,
+                preview_points,
+                session_days=_review_session_days(
+                    int(onboarding_cfg.get("days") or 0),
+                    int(onboarding_cfg.get("reviewCount") or 0),
+                ),
+                daily_minutes=round(float(onboarding_cfg.get("dailyHours") or 0) * 60) or 120,
+            )
+        )
+    else:
+        _remap_tasks_to_review_sessions(
+            normalized_tasks,
+            int(onboarding_cfg.get("days") or 0),
+            int(onboarding_cfg.get("reviewCount") or 0),
+        )
+    workspace["schedulingWarnings"] = preview_warnings
     if normalized_tasks:
         workspace["tasks"] = normalized_tasks
     workspace["practiceQuestions"] = []
@@ -3225,6 +3412,45 @@ def _write_content_plan_preview(
     strategy_documents["maintenancePending"] = False
     strategy_documents["lastAgentRunId"] = run_id
     workspace["generationWarning"] = "复习主线任务骨架已生成，讲义、例题和练习仍在后台补齐。"
+    save_workspace(workspace, course_id)
+
+
+def _write_content_lesson_preview(
+    course_id: str,
+    task_id: str,
+    task_with_guide: dict[str, Any],
+    practice_questions: list[dict[str, Any]],
+    run_id: str,
+) -> None:
+    """逐节增量落盘：把单节 studyGuide 写进 workspace.json，让前端轮询能实时看到卡片翻成「开始学习」。"""
+    workspace = load_workspace(course_id, refresh_materials=False)
+    updated = False
+    for task in workspace.get("tasks", []):
+        if str(task.get("id", "")) == task_id:
+            guide = task_with_guide.get("studyGuide")
+            if isinstance(guide, dict):
+                task["studyGuide"] = guide
+            warning = task_with_guide.get("contentQualityWarning")
+            if warning:
+                task["contentQualityWarning"] = str(warning)
+            else:
+                task.pop("contentQualityWarning", None)
+            updated = True
+            break
+    if not updated:
+        # 骨架预览尚未写入或 id 不匹配，跳过；最终 sanitize 会兜底。
+        return
+    existing_ids = {
+        str(question.get("id"))
+        for question in workspace.get("practiceQuestions", [])
+        if isinstance(question, dict)
+    }
+    bucket = workspace.setdefault("practiceQuestions", [])
+    for question in practice_questions:
+        if isinstance(question, dict) and str(question.get("id")) not in existing_ids:
+            bucket.append(question)
+            existing_ids.add(str(question.get("id")))
+    workspace.setdefault("strategyDocuments", {})["lastAgentRunId"] = run_id
     save_workspace(workspace, course_id)
 
 
@@ -3340,13 +3566,14 @@ def _approve_strategy_documents_legacy(
   "assessmentProfile":{"summary":"...","questionTypes":["..."]},
   "diagnostic":{"estimatedScore":"...","message":"..."},
   "modules":[{"id":"英文短横线 id","title":"按学科主题的模块名（如 力学/电磁学/资金时间价值），禁止照搬资料文件名或资料自带章节","order":1}],
-  "knowledgePoints":[{"id":"英文短横线 id","name":"...","mastery":0-100,"weight":1-30,"summary":"用简短一两句话描述该知识点的关键知识，不要罗列资料出处","source":"...","moduleId":"必须命中 modules 中的某个 id"}],
+  "knowledgePoints":[{"id":"英文短横线 id","name":"...","mastery":0-100,"weight":1-30,"difficulty":1-5,"prerequisites":["其他知识点id，仅当存在真实学习先后依赖时才填，禁止填自身、编造id或形成环"],"summary":"用简短一两句话描述该知识点的关键知识，不要罗列资料出处","source":"...","moduleId":"必须命中 modules 中的某个 id"}],
   "tasks":[{"id":"英文短横线 id","courseId":"课程 id","day":1-14,"order":1,"title":"...","description":"...","source":"内部依据，不在界面展示","duration":整数分钟,"progress":0,"weight":1-30,"knowledgePointId":"...","status":"pending","priority":"high|medium|low","studyGuide":{"objectives":["..."],"concepts":[{"title":"...","body":"...","formula":"..."}],"example":{"title":"...","setup":"...","steps":["..."],"conclusion":"..."},"checklist":["..."]}}],
   "practiceQuestions":[{"id":"英文短横线 id","type":"single","score":5,"prompt":"...","options":["...","...","...","..."],"answerIndex":0-3,"explanation":"...","knowledgePointId":"...","source":"..."}],
   "mockQuestions":[{"id":"英文短横线 id","type":"single","questionType":"单项选择题","score":5-15,"prompt":"...","options":["...","...","...","..."],"answerIndex":0-3,"explanation":"...","knowledgePointId":"...","source":"..."},{"id":"英文短横线 id","type":"calculation","questionType":"计算题","score":10-30,"prompt":"完整计算题题干","referenceAnswer":"参考答案和关键计算过程","gradingRubric":["评分点"],"explanation":"详细解析","knowledgePointId":"...","source":"..."}]
 }
 规则：任务覆盖用户填写的复习天数和每日时间；练习偏向摸底错误知识点；模拟卷必须先仿照上传资料中的模拟卷/样卷/真题结构，没有样卷时再按用户填写的考试形式和备注编排题型、题量与分值比例，例如“选择30分计算题70分”就按 30/70 组织；计算题、综合题、简答题必须返回 type="calculation" 且包含 referenceAnswer 和 gradingRubric，不能压成选择题；任务内容必须服从已确认复习计划。source 字段仅作为内部元数据，标题、描述、讲义、例题、自测解析等用户可见内容不要写“来源、出处、资料依据、参考”。
 modules 代表课程的几大知识模块（通常 4-8 个），必须基于你对课程内容的理解按学科主题划分（如「力学」「电磁学」「资金时间价值」「图论」）；上传资料仅作学习素材，严禁把资料文件名或资料自带的章节划分直接搬进 modules，也不得把每个知识点各列一章。跨章节的综合复习/答题模板类内容并入最贴近的主题模块。每个 knowledgePoint 必须通过 moduleId 归到且仅归到一个 module，moduleId 必须命中 modules 中已声明的某个 id。
+knowledgePoints 的 difficulty 表示学习难度（1 最简单、5 最难，依据资料的抽象程度和计算复杂度判断）；prerequisites 只填真实存在的学习先后依赖（如先「资金时间价值」后「方案比选」），无依赖就不要填；tasks 的 day 与 order 仍按每日时间预算正常编排，系统会基于依赖关系统一重排复习顺序。
 """
     try:
         candidate = _extract_json(
@@ -3406,8 +3633,17 @@ def approve_strategy_documents(
             )
             evidence_context = retrieval.get("context", "") or _source_context(materials, course_id)
             def publish_content_progress(update: dict[str, Any]) -> None:
-                if update.get("stage") == "content_plan" and isinstance(update.get("candidate"), dict):
+                stage = update.get("stage")
+                if stage == "content_plan" and isinstance(update.get("candidate"), dict):
                     _write_content_plan_preview(course_id, update["candidate"], workspace, str(update.get("runId", "")))
+                elif stage == "lesson_built" and isinstance(update.get("task"), dict):
+                    _write_content_lesson_preview(
+                        course_id,
+                        str(update["task"].get("id", "")),
+                        update["task"],
+                        update.get("practiceQuestions") or [],
+                        str(update.get("runId", "")),
+                    )
 
             result = run_content_workflow(
                 course_id,
@@ -3741,6 +3977,154 @@ operations 至少 1 条、最多 12 条；确实没有合理调整时返回 oper
     )
 
 
+def replan_review_mainline(
+    course_id: str,
+    *,
+    new_exam_date: str,
+    new_days: int,
+    new_daily_hours: float,
+) -> dict[str, Any]:
+    """按新的考试日期/复习天数/每日时长重新编排复习主线，生成携带新参数的 adjustment_proposal。
+
+    参数不在此处落地，待用户「采纳」时由 apply_proposal 写入；「忽略」则参数与 tasks 都不动。
+    失败抛 RuntimeError（同步端点，用户在等），由路由层映射为 502。
+    """
+    workspace = load_workspace(course_id, refresh_materials=False)
+    progress = build_daily_progress(workspace)
+    today_day = int(progress["todayDay"])
+    new_budget = max(5, int(round(new_daily_hours * 60)))
+    upper_day = max(today_day, new_days)  # new_days < today_day 时的兜底区间右端
+
+    all_tasks = [task for task in workspace.get("tasks", []) if isinstance(task, dict)]
+    movable_ids = {
+        str(task.get("id")) for task in all_tasks if task.get("status") != "completed"
+    }
+
+    compact_state = {
+        "event": "用户调整复习参数后重新编排",
+        "todayDay": today_day,
+        "newDays": new_days,
+        "newDailyBudgetMinutes": new_budget,
+        "effectiveRange": [today_day, upper_day],
+        "course": {
+            **workspace.get("course", {}),
+            "examDate": new_exam_date,
+            "dailyHours": new_daily_hours,
+        },
+        "onboarding": {
+            **(workspace.get("onboarding") or {}),
+            "examDate": new_exam_date,
+            "days": new_days,
+            "dailyHours": new_daily_hours,
+        },
+        "movableTasks": [
+            {
+                "id": task.get("id"),
+                "title": task.get("title"),
+                "day": task.get("day"),
+                "order": task.get("order"),
+                "duration": task.get("duration"),
+                "status": task.get("status"),
+                "priority": task.get("priority"),
+                "knowledgePointId": task.get("knowledgePointId"),
+                "weight": task.get("weight"),
+            }
+            for task in all_tasks
+            if str(task.get("id")) in movable_ids
+        ],
+        "completedTaskSummary": {
+            "count": sum(1 for task in all_tasks if task.get("status") == "completed"),
+            "totalMinutes": sum(
+                int(task.get("duration", 0))
+                for task in all_tasks
+                if task.get("status") == "completed"
+            ),
+        },
+    }
+
+    task_prompt = """
+你负责根据用户调整后的「考试日期 / 复习天数 / 每日复习时间」重新编排复习主线，只生成可执行的操作列表，不直接改写计划文档。
+核心约束（必须严格遵守）：
+1. status == "completed" 的任务视为已完成，绝对禁止改动（不能 move，也不能改 duration/priority）；你只能操作 movableTasks 列表里出现的任务。
+2. 只允许输出 move_task / change_duration / change_priority 三种操作；禁止 remove_task，禁止删除任何已生成的 studyGuide 或练习题。
+3. 所有被移动任务的 day 必须落在 effectiveRange 区间内（含端点）；day 小于 todayDay 的未完成任务必须顺延到 todayDay 及之后。
+4. 目标：让 [todayDay, newDays] 区间内每一天未完成任务的 duration 合计尽量落在 newDailyBudgetMinutes 的 0.8 ~ 1.0 倍之间；priority 较高的任务优先排在更靠近 todayDay 的天数，保持知识点的先后与难度递进。
+5. 优先压缩而非删除：当可用容量不足时，用 change_duration 适度缩减 priority 较低任务的时长（不得低于 5 分钟），或用 change_priority 调整权重让重要任务占据有效容量；宁可让个别日子的合计略超 newDailyBudgetMinutes，也不要删除任何任务。
+6. 若 newDays 小于 todayDay（考试已临近），把剩余未完成任务集中到 effectiveRange 区间，并在 reason 中明确说明这些日子可能显著超额、建议用户适当提高每日时长或接受高强度冲刺。
+字段约束：move_task 的 day 取值 1-30、order 取值 1-100；change_duration 的 minutes 必须 5-720；change_priority 的 priority 取值 high|medium|low。
+只返回 JSON：{"title":"一句话标题","reason":"为什么这么重排","impact":"重排后效果（每天负载变化、是否有日子超额）","operations":[{"type":"move_task|change_duration|change_priority","task_id":"...","day":整数,"order":整数,"minutes":整数,"priority":"high|medium|low"}]}
+operations 至少 1 条；确实无需调整时返回 operations=[]。
+"""
+    try:
+        parsed = _extract_json(
+            _model_completion(
+                build_model_messages(
+                    task_prompt,
+                    json.dumps(compact_state, ensure_ascii=False, indent=2),
+                    course_prompt=get_course_prompt(course_id),
+                ),
+                json_mode=True,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(f"AI 重新编排失败：{error}") from error
+
+    operations = parsed.get("operations")
+    if not isinstance(operations, list):
+        raise RuntimeError("AI 返回的操作列表格式无效")
+
+    # 清洗：类型白名单 + task_id 必须在未完成集合里（防止 LLM 误改已完成任务）
+    cleaned = [
+        operation
+        for operation in operations
+        if isinstance(operation, dict)
+        and operation.get("task_id")
+        and str(operation.get("task_id")) in movable_ids
+        and operation.get("type") in {"move_task", "change_duration", "change_priority"}
+    ]
+    if not cleaned:
+        raise RuntimeError("AI 未给出任何有效重排操作，请稍后重试或调整参数")
+
+    latest_workspace = load_workspace(course_id, refresh_materials=False)
+    try:
+        after_tasks = apply_operations_to_copy(latest_workspace, cleaned)
+    except ValueError as error:
+        raise RuntimeError(f"重排操作非法：{error}") from error
+
+    def _summary(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "totalMinutes": sum(int(task.get("duration", 0)) for task in tasks),
+            "tasks": [
+                {
+                    "id": task.get("id"),
+                    "day": task.get("day"),
+                    "duration": task.get("duration"),
+                    "status": task.get("status"),
+                }
+                for task in tasks
+            ],
+        }
+
+    proposal = create_adjustment_proposal(
+        course_id,
+        base_revision=int(latest_workspace.get("planRevision", 0)),
+        title=str(parsed.get("title", "按新参数重新编排复习主线")).strip()[:200]
+        or "按新参数重新编排复习主线",
+        reason=str(parsed.get("reason", "")).strip()[:2000],
+        impact=str(parsed.get("impact", "")).strip()[:2000],
+        operations=cleaned,
+        before=_summary(latest_workspace.get("tasks", [])),
+        after=_summary(after_tasks),
+        source_run_id="",
+        params={
+            "examDate": new_exam_date,
+            "days": new_days,
+            "dailyHours": new_daily_hours,
+        },
+    )
+    return proposal
+
+
 def _sanitize_generated_workspace(candidate: dict[str, Any], materials: list[dict[str, Any]]) -> dict[str, Any]:
     fallback = _fallback_workspace(materials)
     for key in ("assessmentProfile", "diagnostic", "knowledgePoints", "tasks", "practiceQuestions", "mockQuestions"):
@@ -3754,11 +4138,22 @@ def _sanitize_generated_workspace(candidate: dict[str, Any], materials: list[dic
         and int(task.get("day", 0)) in (1, 2, 3)
         and int(task.get("duration", 0)) > 0
     ]
+    bootstrap_points = [
+        point
+        for point in fallback.get("knowledgePoints", [])
+        if isinstance(point, dict)
+    ]
+    bootstrap_warnings = study_scheduler.sanitize_dependencies(bootstrap_points)
+    bootstrap_kp_order = study_scheduler.topological_rank(bootstrap_points)
     normalized_tasks: list[dict[str, Any]] = []
     for day in (1, 2, 3):
         day_tasks = [task for task in filtered_tasks if int(task["day"]) == day][:2]
         if len(day_tasks) != 2:
             return _fallback_workspace(materials)
+        # 每日组内按知识点拓扑序排（bootstrap 保持每天 2 任务/合计 120 分钟的硬约束）。
+        day_tasks.sort(
+            key=lambda task: bootstrap_kp_order.get(str(task.get("knowledgePointId") or ""), 9999)
+        )
         day_total = sum(int(task["duration"]) for task in day_tasks)
         if day_total != 120:
             day_tasks[-1]["duration"] = max(30, int(day_tasks[-1]["duration"]) + (120 - day_total))
@@ -3770,6 +4165,7 @@ def _sanitize_generated_workspace(candidate: dict[str, Any], materials: list[dic
         task["progress"] = 0
         task["status"] = "pending"
     fallback["tasks"] = normalized_tasks
+    fallback["schedulingWarnings"] = bootstrap_warnings
     fallback["practiceQuestions"] = fallback["practiceQuestions"][:6]
     if not fallback.get("mockQuestions"):
         fallback["mockQuestions"] = _fallback_mock_questions()
@@ -3795,7 +4191,7 @@ def bootstrap_engineering_workspace(force: bool = False) -> dict[str, Any]:
   "assessmentProfile":{"summary":"...","questionTypes":["..."]},
   "diagnostic":{"estimatedScore":"...","message":"..."},
   "modules":[{"id":"英文短横线 id","title":"按学科主题的模块名（如 力学/电磁学/资金时间价值），禁止照搬资料文件名或资料自带章节","order":1}],
-  "knowledgePoints":[{"id":"英文短横线 id","name":"...","mastery":0-100,"weight":1-30,"summary":"用简短一两句话描述该知识点的关键知识，不要罗列资料出处","source":"...","moduleId":"必须命中 modules 中的某个 id"}],
+  "knowledgePoints":[{"id":"英文短横线 id","name":"...","mastery":0-100,"weight":1-30,"difficulty":1-5,"prerequisites":["其他知识点id，仅当存在真实学习先后依赖时才填，禁止填自身、编造id或形成环"],"summary":"用简短一两句话描述该知识点的关键知识，不要罗列资料出处","source":"...","moduleId":"必须命中 modules 中的某个 id"}],
   "tasks":[{"id":"英文短横线 id","courseId":"engineering-economics","day":1-3,"order":1-3,"title":"...","description":"...","source":"内部依据，不在界面展示","duration":整数分钟,"progress":0,"weight":1-30,"knowledgePointId":"对应知识点 id","status":"pending","priority":"high|medium|low","studyGuide":{"objectives":["..."],"concepts":[{"title":"...","body":"...","formula":"..."}],"example":{"title":"...","setup":"...","steps":["..."],"conclusion":"..."},"checklist":["..."]}}],
   "practiceQuestions":[{"id":"英文短横线 id","type":"single","score":5,"prompt":"...","options":["...","...","...","..."],"answerIndex":0-3,"explanation":"...","knowledgePointId":"...","source":"..."}],
   "mockQuestions":[选择题用 type="single" 且包含 options/answerIndex；计算题用 type="calculation" 且包含 referenceAnswer/gradingRubric，分值与题量按模拟卷或用户说明动态决定]
@@ -3805,6 +4201,7 @@ def bootstrap_engineering_workspace(force: bool = False) -> dict[str, Any]:
 模拟卷必须按完整考试感组织：优先仿照资料中的模拟卷/样卷/真题结构；没有样卷时再按资料和考试说明动态编排题型、题量和分值比例。选择题返回 type="single"、options 和 answerIndex；计算题/综合题返回 type="calculation"、referenceAnswer 和 gradingRubric，题干要要求写出计算过程、公式代入和最终答案，不能压成选择题。
 每题必须可由所给资料判断，解释必须清楚给出关键公式或结论。真题题型优先覆盖资金时间价值、税后现金流、回收期、NPV/IRR/NAV、多方案、盈亏平衡和 Excel 口径。
 modules 给出课程的几大知识模块（如「资金时间价值」「现金流与评价指标」「多方案经济评价」「不确定性分析」），必须基于对课程内容的理解按学科主题划分；上传资料仅作学习素材，严禁照搬资料文件名或资料自带的章节划分，也不得把每个知识点各列一章；每个 knowledgePoint 必须通过 moduleId 归到且仅归到一个 module，moduleId 必须命中 modules 中已声明的某个 id。
+knowledgePoints 的 difficulty 表示学习难度（1 最简单、5 最难，依据资料的抽象程度和计算复杂度判断）；prerequisites 只填真实存在的学习先后依赖（如先「资金时间价值」后「方案比选」），无依赖就不要填；tasks 的 day 与 order 仍按每日预算正常编排，系统会基于依赖关系统一重排复习顺序。
 """
     try:
         generated = _extract_json(
@@ -4319,8 +4716,12 @@ def generate_mind_map(course_id: str = DEFAULT_COURSE_ID) -> dict[str, Any]:
         point for point in workspace.get("knowledgePoints", []) if isinstance(point, dict)
     ]
     knowledge_ids: dict[str, str] = {}
+    prerequisite_sources: dict[str, list[str]] = {}
     for index, point in enumerate(knowledge_points):
         point_id = _knowledge_point_pid(point, index)
+        prereq_list = point.get("prerequisites")
+        if isinstance(prereq_list, list) and prereq_list:
+            prerequisite_sources[point_id] = [str(item) for item in prereq_list]
         parent_id = module_node_ids.get(point_to_module.get(point_id)) or course_node_id
         knowledge_id = add_node(
             {
@@ -4338,6 +4739,17 @@ def generate_mind_map(course_id: str = DEFAULT_COURSE_ID) -> dict[str, Any]:
         )
         knowledge_ids[point_id] = knowledge_id
         add_edge(parent_id, knowledge_id, "知识点")
+
+    # 知识点之间的前置依赖边（前置 → 依赖方）：跨模块也照画，
+    # 前端 elk 布局会过滤掉这类边（保持树形稳定），仅在布局后叠加绘制。
+    for dependent_id, prereq_ids in prerequisite_sources.items():
+        for prereq in prereq_ids:
+            if prereq in knowledge_ids and dependent_id in knowledge_ids:
+                add_edge(
+                    knowledge_ids[prereq],
+                    knowledge_ids[dependent_id],
+                    study_scheduler.PREREQUISITE_EDGE_LABEL,
+                )
 
     task_chapter_id = chapter_for("复习任务", len(chapter_ids) + 1, kind="bucket")
     for index, task in enumerate(workspace.get("tasks", [])):
@@ -4760,19 +5172,17 @@ def _prioritize_tasks(workspace: dict[str, Any], knowledge_point_id: str, is_cor
             task["priority"] = "high"
             task["description"] = f"{task['description']} 本题失分后已被置为优先复练。"
 
-    order_by_point = {
-        point["id"]: point.get("mastery", 0)
-        for point in workspace.get("knowledgePoints", [])
-    }
-    workspace["tasks"].sort(
-        key=lambda task: (
-            task.get("day", 9),
-            order_by_point.get(task.get("knowledgePointId"), 100),
-            -int(task.get("weight", 0)),
-        )
+    onboarding_cfg = workspace.get("onboarding") or {}
+    study_scheduler.reprioritize_pending(
+        workspace["tasks"],
+        workspace.get("knowledgePoints", []),
+        session_days=_review_session_days(
+            int(onboarding_cfg.get("days") or 0),
+            int(onboarding_cfg.get("reviewCount") or 0),
+        ),
+        daily_minutes=round(float(onboarding_cfg.get("dailyHours") or 0) * 60) or 120,
+        modules=workspace.get("modules") if isinstance(workspace.get("modules"), list) else None,
     )
-    for index, task in enumerate(workspace["tasks"], start=1):
-        task["order"] = index
 
 
 def submit_practice_answer(
@@ -5021,11 +5431,23 @@ def update_workspace_state(
     note: str | None = None,
     course_id: str = DEFAULT_COURSE_ID,
 ) -> dict[str, Any]:
-    workspace = load_workspace(course_id)
+    workspace = load_workspace(course_id, refresh_materials=False)
     previous_tasks = list(workspace.get("tasks", []))
     if tasks is not None:
-        workspace["tasks"] = tasks
-        record_review_progress(course_id, previous_tasks, tasks)
+        # 手动调整后的 DAG 修复：违规 pending 任务顺延到前置之后，修复+警告放行（不硬拒）。
+        onboarding_cfg = workspace.get("onboarding") or {}
+        reconciled_tasks, scheduling_warnings = study_scheduler.enforce_dag_order(
+            tasks,
+            workspace.get("knowledgePoints", []),
+            session_days=_review_session_days(
+                int(onboarding_cfg.get("days") or 0),
+                int(onboarding_cfg.get("reviewCount") or 0),
+            ),
+            daily_minutes=round(float(onboarding_cfg.get("dailyHours") or 0) * 60) or 120,
+        )
+        workspace["tasks"] = reconciled_tasks
+        workspace["schedulingWarnings"] = scheduling_warnings
+        record_review_progress(course_id, previous_tasks, reconciled_tasks)
     if wrong_answers is not None:
         workspace["wrongAnswers"] = wrong_answers
     if note is not None:
@@ -5097,6 +5519,61 @@ def _summarize_chat_memories(
         )
 
 
+CONVERSATION_RECENT_TURNS = 8
+CONVERSATION_SUMMARY_BATCH = 8
+
+
+def _summarize_turn_batch(batch: list[dict[str, Any]]) -> str:
+    """把一批对话原文压缩成一段脉络摘要；模型不可用时返回空串。"""
+    dialog = "\n".join(
+        f"{'用户' if item['role'] == 'user' else 'AI'}：{item['content']}" for item in batch
+    )
+    prompt = (
+        "你是对话脉络压缩器。把下面这段师生对话压缩成不超过 140 字的脉络摘要："
+        "保留讨论的核心主题、已给出的关键结论、举过的例子或方法、用户透露的困惑或决定；"
+        "丢弃寒暄、重复和与学习无关的内容。只输出摘要正文，不要标题或项目符号。"
+    )
+    try:
+        text = _model_completion(build_model_messages(prompt, dialog))
+    except Exception:
+        return ""
+    return text.strip()[:500]
+
+
+def _maintain_rolling_summary(course_id: str, mode: str) -> None:
+    """在每轮对话收尾后调用：把超出近期窗口的积压对话滚动压缩成脉络摘要。
+
+    留出最近 CONVERSATION_RECENT_TURNS 条原文不压缩（仍由近期窗口承载），
+    每次只压缩最老的 CONVERSATION_SUMMARY_BATCH 条；某批压缩失败即中断，
+    保留待下次重试，避免 to_turn_id 出现空洞导致中间区间永远无法被压缩。
+    摘要全程静默降级，绝不影响主对话。
+    """
+    conversation_mode = "agent" if mode == "agent" else "chat"
+    try:
+        after_id = latest_summarized_turn_id(course_id, mode=conversation_mode)
+        pending = unsummarized_chat_turns(course_id, mode=conversation_mode, after_turn_id=after_id)
+        if len(pending) <= CONVERSATION_RECENT_TURNS:
+            return
+        reservable = len(pending) - CONVERSATION_RECENT_TURNS
+        summarizable = pending[:reservable]
+        for start in range(
+            0, len(summarizable) - CONVERSATION_SUMMARY_BATCH + 1, CONVERSATION_SUMMARY_BATCH
+        ):
+            batch = summarizable[start : start + CONVERSATION_SUMMARY_BATCH]
+            content = _summarize_turn_batch(batch)
+            if not content:
+                break
+            record_chat_summary(
+                course_id,
+                content,
+                batch[0]["id"],
+                batch[-1]["id"],
+                mode=conversation_mode,
+            )
+    except Exception:
+        return
+
+
 def _agent_chat_legacy(message: str, course_id: str = DEFAULT_COURSE_ID) -> dict[str, Any]:
     workspace = load_workspace(course_id)
     onboarding = workspace.get("onboarding", {})
@@ -5106,6 +5583,11 @@ def _agent_chat_legacy(message: str, course_id: str = DEFAULT_COURSE_ID) -> dict
             "目标分数": onboarding.get("targetScore", workspace.get("course", {}).get("targetScore", 80)),
             "目标描述": onboarding.get("targetText", ""),
             "复习天数": onboarding.get("days", 3),
+            "复习次数": onboarding.get("reviewCount") or onboarding.get("days", 3),
+            "复习日": _review_session_days(
+                int(onboarding.get("days", 3) or 3),
+                int(onboarding.get("reviewCount") or 0),
+            ),
             "每日小时": onboarding.get("dailyHours", workspace.get("course", {}).get("dailyHours", 2)),
             "考试日期": onboarding.get("examDate", workspace.get("course", {}).get("examDate", "")),
         },
@@ -5153,14 +5635,22 @@ def _agent_chat_legacy(message: str, course_id: str = DEFAULT_COURSE_ID) -> dict
     try:
         retrieval = retrieve_material_context(course_id, message, limit=6)
         memory_context = learner_memory_context(course_id, message, limit=5)
-        history = recent_chat_messages(course_id, mode="chat", limit=8)
+        conv_memory = build_conversation_memory(course_id, message, mode="chat")
+        history = conv_memory["recent"]
     except Exception:
         retrieval = {"items": [], "context": "", "semanticUsed": False}
         memory_context = ""
         history = []
+        conv_memory = {"recent": [], "summary_text": "", "related_text": ""}
     history_text = "\n".join(
         f"{'用户' if item['role'] == 'user' else 'AI'}：{item['content']}" for item in history
     )
+    remote_parts: list[str] = []
+    if conv_memory["summary_text"]:
+        remote_parts.append(f"【早期对话摘要】\n{conv_memory['summary_text']}")
+    if conv_memory["related_text"]:
+        remote_parts.append(f"【早期相关对话】\n{conv_memory['related_text']}")
+    remote_memory_text = ("\n\n" + "\n\n".join(remote_parts)) if remote_parts else ""
     timestamp_ms = int(datetime.now().timestamp() * 1000)
     user_message_id = f"user-{timestamp_ms}"
     assistant_message_id = f"assistant-{timestamp_ms + 1}"
@@ -5184,7 +5674,7 @@ def _agent_chat_legacy(message: str, course_id: str = DEFAULT_COURSE_ID) -> dict
                 (
                     f"【当前状态】\n{json.dumps(compact_state, ensure_ascii=False)}\n\n"
                     f"【长期学习记忆】\n{memory_context or '暂无'}\n\n"
-                    f"【近期对话】\n{history_text or '暂无'}\n\n"
+                    f"【近期对话】\n{history_text or '暂无'}{remote_memory_text}\n\n"
                     f"【本轮检索资料】\n{retrieval['context'] or '未检索到直接相关资料'}\n\n"
                     f"【用户本轮问题】\n{message}"
                 ),
@@ -5213,6 +5703,7 @@ def _agent_chat_legacy(message: str, course_id: str = DEFAULT_COURSE_ID) -> dict
         workspace.get("knowledgePoints", []),
         assistant_message_id,
     )
+    _maintain_rolling_summary(course_id, "chat")
     workspace.setdefault("messages", []).extend(
         [
             {
@@ -5258,11 +5749,15 @@ def _build_agent_messages(
         workspace = load_workspace(course_id)
     course = workspace.get("course", {})
     conversation_mode = "agent" if mode == "agent" else "chat"
-    history = recent_chat_messages(course_id, mode=conversation_mode, limit=8)
+    conv_memory = build_conversation_memory(course_id, message, mode=conversation_mode)
+    history = conv_memory["recent"]
     system_prompt = (
         f"{PLATFORM_SYSTEM_PROMPT}\n\n"
         f"你是 {course.get('name', '当前课程')} 的 Tutor Agent。"
         "个性化建议前使用 get_learning_state；涉及课程事实、公式、题型或出处时使用 search_materials。"
+        "用户明确提供公开网页链接并要求分析链接内容时，使用 fetch_web_page 读取网页。"
+        "用户未提供明确网址但要求查找外部网页资料、最新信息、教程或参考来源时，使用 search_web 联网搜索。"
+        "用户要求搜索或读取 arXiv 论文时，使用 search_arxiv_papers 或 read_arxiv_paper；英文论文内容应按用户要求用中文解释、摘要或翻译。"
         "用户要求调整任务、日期、时长或优先级时，使用 propose_plan_change 创建待确认提案，绝不能声称已经修改。"
         "当 get_learning_state 返回的 dailyProgress.overBudget 为 true、或 dailyProgress.overdue 非空、或某知识点反复出错（count≥2）时，应主动调用 propose_plan_change 给出待确认的减负/顺延/重排提案，并说明理由与影响，再由用户决定是否采纳。"
         "用户要求给某节补充例题时，使用 propose_plan_change 的 add_worked_example 操作创建待确认提案；"
@@ -5301,6 +5796,19 @@ def _build_agent_messages(
                 "role": "system",
                 "content": "【当前界面上下文，仅用于消解用户指代，不要在回答中逐字复述】\n"
                 + json.dumps(context, ensure_ascii=False),
+            }
+        )
+    remote_parts: list[str] = []
+    if conv_memory["summary_text"]:
+        remote_parts.append(f"【早期对话摘要】\n{conv_memory['summary_text']}")
+    if conv_memory["related_text"]:
+        remote_parts.append(f"【早期相关对话】\n{conv_memory['related_text']}")
+    if remote_parts:
+        messages.append(
+            {
+                "role": "system",
+                "content": "【更早的对话脉络，补充近期上下文之外的背景，不要逐字复述】\n"
+                + "\n\n".join(remote_parts),
             }
         )
     messages.extend(
@@ -5419,6 +5927,7 @@ def agent_chat_stream(
         workspace.get("knowledgePoints", []),
         assistant_message_id,
     )
+    _maintain_rolling_summary(course_id, conversation_mode)
     latest_workspace = load_workspace(course_id, refresh_materials=False)
     latest_workspace.setdefault("messages", []).extend(
         [
@@ -5466,11 +5975,15 @@ def agent_chat(
     workspace = load_workspace(course_id)
     course = workspace.get("course", {})
     conversation_mode = "agent" if mode == "agent" else "chat"
-    history = recent_chat_messages(course_id, mode=conversation_mode, limit=8)
+    conv_memory = build_conversation_memory(course_id, message, mode=conversation_mode)
+    history = conv_memory["recent"]
     system_prompt = (
         f"{PLATFORM_SYSTEM_PROMPT}\n\n"
         f"你是 {course.get('name', '当前课程')} 的 Tutor Agent。"
         "个性化建议前使用 get_learning_state；涉及课程事实、公式、题型或出处时使用 search_materials。"
+        "用户明确提供公开网页链接并要求分析链接内容时，使用 fetch_web_page 读取网页。"
+        "用户未提供明确网址但要求查找外部网页资料、最新信息、教程或参考来源时，使用 search_web 联网搜索。"
+        "用户要求搜索或读取 arXiv 论文时，使用 search_arxiv_papers 或 read_arxiv_paper；英文论文内容应按用户要求用中文解释、摘要或翻译。"
         "用户要求调整任务、日期、时长或优先级时，使用 propose_plan_change 创建待确认提案，绝不能声称已经修改。"
         "当 get_learning_state 返回的 dailyProgress.overBudget 为 true、或 dailyProgress.overdue 非空、或某知识点反复出错（count≥2）时，应主动调用 propose_plan_change 给出待确认的减负/顺延/重排提案，并说明理由与影响，再由用户决定是否采纳。"
         "用户要求给某节补充例题时，使用 propose_plan_change 的 add_worked_example 操作创建待确认提案；"
@@ -5509,6 +6022,19 @@ def agent_chat(
                 "role": "system",
                 "content": "【当前界面上下文，仅用于消解用户指代，不要在回答中逐字复述】\n"
                 + json.dumps(context, ensure_ascii=False),
+            }
+        )
+    remote_parts: list[str] = []
+    if conv_memory["summary_text"]:
+        remote_parts.append(f"【早期对话摘要】\n{conv_memory['summary_text']}")
+    if conv_memory["related_text"]:
+        remote_parts.append(f"【早期相关对话】\n{conv_memory['related_text']}")
+    if remote_parts:
+        messages.append(
+            {
+                "role": "system",
+                "content": "【更早的对话脉络，补充近期上下文之外的背景，不要逐字复述】\n"
+                + "\n\n".join(remote_parts),
             }
         )
     messages.extend(
@@ -5564,6 +6090,7 @@ def agent_chat(
         workspace.get("knowledgePoints", []),
         assistant_message_id,
     )
+    _maintain_rolling_summary(course_id, conversation_mode)
     latest_workspace = load_workspace(course_id, refresh_materials=False)
     latest_workspace.setdefault("messages", []).extend(
         [

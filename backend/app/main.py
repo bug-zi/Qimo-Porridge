@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .agent_runtime import (
@@ -22,6 +22,8 @@ from .agent_runtime import (
     get_agent_run,
     get_external_source,
     initialize_agent_database,
+    last_proposal_resolution_at,
+    list_pending_proposals,
 )
 from .agents.tools import apply_proposal, dismiss_proposal
 from .external_source_service import (
@@ -43,6 +45,7 @@ from .knowledge_service import (
 from .mcp_gateway import discover_mcp_tools, list_mcp_servers, save_mcp_server, seed_mcp_presets
 from .study_service import (
     agent_chat,
+    agent_chat_stream,
     approve_strategy_documents,
     build_material_preview,
     bootstrap_engineering_workspace,
@@ -50,18 +53,26 @@ from .study_service import (
     create_empty_course_workspace,
     fetch_available_model_ids,
     generate_strategy_documents,
+    generate_mind_map,
     get_runtime_model_api_key,
     get_runtime_model_profile,
     get_strategy_documents,
+    load_mind_map,
+    get_user_profile_prompt,
     load_workspace,
     maintain_review_plan,
     mark_strategy_maintenance_pending,
+    clear_practice_answer,
+    clear_mock_result,
     refresh_workspace_materials,
+    regroup_course_modules,
     resolve_course_material_path,
     resolve_converted_material_pdf_path,
     save_workspace,
+    save_mind_map,
     save_runtime_model_profile,
     save_strategy_documents,
+    save_user_profile_prompt,
     delete_course_material,
     save_course_setup,
     submit_course_diagnostic,
@@ -73,6 +84,12 @@ from .study_service import (
     upload_course_materials,
     update_workspace_state,
     update_course_prompt,
+    record_time,
+    delete_time_entry,
+    build_daily_progress,
+    rebalance_daily_plan,
+    update_course_plan_params,
+    replan_review_mainline,
 )
 
 DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
@@ -96,11 +113,32 @@ def _approve_strategy_documents_job(course_id: str, payload: dict[str, Any]) -> 
     return {"courseId": course_id, "planned": True}
 
 
+def _rebalance_plan_job(course_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    rebalance_daily_plan(course_id, str(payload.get("event", "每日时间核对")))
+    return {"rebalanced": True}
+
+
+# 用户「采纳/忽略」一条调整建议后，在此冷却时间内不再自动生成新建议，
+# 避免计划仍超额时每次打开空间都补一条建议，造成「卡片永远不消失」的体验。
+PROPOSAL_REBALANCE_COOLDOWN = timedelta(minutes=30)
+
+
+def _recently_resolved_proposal(course_id: str) -> bool:
+    resolved_at = last_proposal_resolution_at(course_id)
+    if not resolved_at:
+        return False
+    try:
+        return datetime.now() - datetime.fromisoformat(resolved_at) < PROPOSAL_REBALANCE_COOLDOWN
+    except ValueError:
+        return False
+
+
 AGENT_JOB_WORKER = AgentJobWorker(
     {
         "maintain_review_plan": _maintain_plan_job,
         "external_source_import": process_external_source_job,
         "approve_strategy_documents": _approve_strategy_documents_job,
+        "rebalance_daily_plan": _rebalance_plan_job,
     }
 )
 
@@ -286,6 +324,10 @@ class RuntimeModelUpdateRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
 
 
+class UserProfilePromptUpdateRequest(BaseModel):
+    content: str = Field(default="", max_length=4000)
+
+
 class EmbeddingConfigRequest(BaseModel):
     enabled: bool = True
     base_url: str = Field(min_length=8, max_length=500)
@@ -305,9 +347,17 @@ class CourseSetupRequest(BaseModel):
     target_score: int = Field(ge=0, le=100)
     target_text: str = Field(default="", max_length=200)
     daily_hours: float = Field(gt=0, le=12)
-    days: int = Field(ge=1, le=14)
+    days: int = Field(ge=1, le=30)
+    review_count: int = Field(default=0, ge=0, le=30)
     exam_format: str = Field(default="", max_length=1000)
     remarks: str = Field(default="", max_length=2000)
+
+
+class PlanParamsAdjustRequest(BaseModel):
+    """计划生成后动态调整参数：三字段全部可选，但至少提供一个。"""
+    exam_date: str | None = Field(default=None, max_length=80)
+    days: int | None = Field(default=None, ge=1, le=30)
+    daily_hours: float | None = Field(default=None, gt=0, le=12)
 
 
 class PracticeAnswerRequest(BaseModel):
@@ -321,7 +371,7 @@ class WrongAnswerRetryRequest(BaseModel):
 
 
 class MockSubmitRequest(BaseModel):
-    answers: dict[str, int]
+    answers: dict[str, Any]
 
 
 class DiagnosticSubmitRequest(BaseModel):
@@ -330,12 +380,21 @@ class DiagnosticSubmitRequest(BaseModel):
 
 class AgentChatRequest(BaseModel):
     message: str = Field(min_length=1)
+    mode: Literal["chat", "agent"] = "chat"
+    context: dict[str, Any] | None = None
 
 
 class WorkspaceUpdateRequest(BaseModel):
     tasks: list[dict[str, Any]] | None = None
     wrong_answers: list[dict[str, Any]] | None = None
     note: str | None = None
+
+
+class TimeLogRequest(BaseModel):
+    task_id: str = Field(default="", max_length=120)
+    minutes: int = Field(ge=1, le=1440)
+    target_date: str = Field(default="", max_length=10)
+    note: str = Field(default="", max_length=200)
 
 
 class StrategyDocumentsUpdateRequest(BaseModel):
@@ -565,9 +624,68 @@ def create_course(payload: CourseCreate) -> CourseResponse:
 @app.get("/api/courses/{course_id}/workspace")
 def course_workspace(course_id: str) -> dict[str, Any]:
     try:
-        return include_strategy_document_content(course_id, load_workspace(course_id))
+        workspace = load_workspace(course_id)
     except (FileNotFoundError, ValueError) as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    progress = build_daily_progress(workspace)
+    pending_proposals = list_pending_proposals(course_id)
+    if (progress["overdue"] or progress["overBudget"]) and not pending_proposals and not _recently_resolved_proposal(course_id):
+        try:
+            enqueue_agent_job(course_id, "rebalance_daily_plan", {"event": "打开课程空间"}, max_attempts=1)
+        except Exception:
+            pass
+    return include_strategy_document_content(
+        course_id,
+        {**workspace, "dailyProgress": progress, "pendingProposals": pending_proposals},
+    )
+
+
+@app.get("/api/courses/{course_id}/mind-map")
+def course_mind_map(course_id: str) -> dict[str, Any]:
+    try:
+        mind_map = load_mind_map(course_id)
+        return {"status": "ready", "courseId": course_id, "mindMap": mind_map}
+    except FileNotFoundError:
+        try:
+            load_workspace(course_id, refresh_materials=False)
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"status": "empty", "courseId": course_id, "mindMap": None}
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.put("/api/courses/{course_id}/mind-map")
+def update_course_mind_map(course_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        mind_map = save_mind_map(payload, course_id)
+        return {"status": "ready", "courseId": course_id, "mindMap": mind_map}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/api/courses/{course_id}/mind-map/generate")
+def generate_course_mind_map(course_id: str) -> dict[str, Any]:
+    try:
+        mind_map = generate_mind_map(course_id)
+        return {"status": "ready", "courseId": course_id, "mindMap": mind_map}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/api/courses/{course_id}/mind-map/regroup-modules")
+def regroup_course_mind_map_modules(course_id: str) -> dict[str, Any]:
+    try:
+        mind_map = regroup_course_modules(course_id)
+        return {"status": "ready", "courseId": course_id, "mindMap": mind_map}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.get("/api/courses/{course_id}/search")
@@ -705,6 +823,65 @@ def configure_course(course_id: str, payload: CourseSetupRequest) -> dict[str, A
                 ),
             )
         return include_strategy_document_content(course_id, workspace)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.post("/api/courses/{course_id}/plan/adjust")
+def adjust_course_plan_params(course_id: str, payload: PlanParamsAdjustRequest) -> dict[str, Any]:
+    """计划生成后动态调整考试日期 / 复习天数 / 每日时间。
+
+    - 仅 examDate 变（days/dailyHours 不变）：立即存参数，不重排，返回 {workspace, proposal: null}。
+    - days 或 dailyHours 变：调 AI 生成携带新参数的重排提案，参数不落地，返回 {proposal, workspace: null}。
+    """
+    if payload.exam_date is None and payload.days is None and payload.daily_hours is None:
+        raise HTTPException(status_code=422, detail="至少需要提供一个要调整的参数")
+    try:
+        workspace = load_workspace(course_id, refresh_materials=False)
+        onboarding = workspace.get("onboarding") or {}
+        course = workspace.get("course") or {}
+        cur_exam = onboarding.get("examDate") or course.get("examDate", "")
+        cur_days = int(onboarding.get("days") or 0)
+        cur_hours = float(course.get("dailyHours") or onboarding.get("dailyHours") or 0)
+
+        new_exam = (payload.exam_date if payload.exam_date is not None else cur_exam) or ""
+        new_days = payload.days if payload.days is not None else cur_days
+        new_hours = payload.daily_hours if payload.daily_hours is not None else cur_hours
+
+        needs_replan = (new_days != cur_days) or (abs(new_hours - cur_hours) > 1e-9)
+
+        if not needs_replan:
+            # 轻量分支：只改考试日期，立即存参数，不重排
+            updated = update_course_plan_params(course_id, exam_date=new_exam or None)
+            with get_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE courses
+                    SET name = ?, exam_date = ?, target_score = ?, daily_hours = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        updated["course"]["name"],
+                        updated["course"]["examDate"],
+                        updated["course"]["targetScore"],
+                        updated["course"]["dailyHours"],
+                        course_id,
+                    ),
+                )
+            if new_exam != cur_exam and mark_strategy_maintenance_pending(course_id, "考试日期已更新"):
+                enqueue_agent_job(course_id, "maintain_review_plan", {"event": "考试日期已更新"})
+            return {"workspace": updated, "proposal": None}
+
+        # 重排分支：调 AI 生成提案，参数不落地
+        proposal = replan_review_mainline(
+            course_id,
+            new_exam_date=new_exam,
+            new_days=new_days,
+            new_daily_hours=new_hours,
+        )
+        return {"proposal": proposal, "workspace": None}
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except RuntimeError as error:
@@ -940,6 +1117,30 @@ def update_course_workspace(
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
+@app.post("/api/courses/{course_id}/time-log")
+def add_course_time_log(course_id: str, payload: TimeLogRequest) -> dict[str, Any]:
+    try:
+        return record_time(
+            course_id,
+            task_id=payload.task_id.strip() or None,
+            minutes=payload.minutes,
+            target_date=payload.target_date.strip() or None,
+            note=payload.note,
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.delete("/api/courses/{course_id}/time-log/{entry_id}")
+def remove_course_time_log(course_id: str, entry_id: str) -> dict[str, Any]:
+    try:
+        return delete_time_entry(course_id, entry_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
 @app.post("/api/courses/{course_id}/practice/answer")
 def answer_course_practice(course_id: str, payload: PracticeAnswerRequest) -> dict[str, Any]:
     try:
@@ -1012,6 +1213,22 @@ def submit_course_mock(
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
+@app.delete("/api/courses/{course_id}/practice/answers/{question_id}")
+def clear_course_practice_answer(course_id: str, question_id: str) -> dict[str, Any]:
+    try:
+        return clear_practice_answer(question_id, course_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.delete("/api/courses/{course_id}/mock/result")
+def clear_course_mock_result(course_id: str) -> dict[str, Any]:
+    try:
+        return clear_mock_result(course_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
 @app.post("/api/courses/{course_id}/agent/chat")
 def chat_with_course_agent(
     course_id: str,
@@ -1019,9 +1236,36 @@ def chat_with_course_agent(
 ) -> dict[str, Any]:
     try:
         message = payload.message.strip()
-        return agent_chat(message, course_id)
+        return agent_chat(message, course_id, mode=payload.mode, context=payload.context)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.post("/api/courses/{course_id}/agent/chat/stream")
+def chat_with_course_agent_stream(course_id: str, payload: AgentChatRequest):
+    def event_source():
+        try:
+            for chunk in agent_chat_stream(
+                payload.message.strip(),
+                course_id,
+                mode=payload.mode,
+                context=payload.context,
+            ):
+                yield chunk
+        except Exception as error:
+            message = "课程尚未初始化。" if isinstance(error, FileNotFoundError) else "AI 伴学暂时无法响应，请稍后再试。"
+            payload_str = json.dumps({"message": message}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload_str}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/api/courses/{course_id}/adjustment-proposals/{proposal_id}/apply")
@@ -1033,6 +1277,24 @@ def apply_course_adjustment_proposal(course_id: str, proposal_id: str) -> dict[s
             load_workspace=lambda value: load_workspace(value, refresh_materials=False),
             save_workspace=save_workspace,
         )
+        # 携带参数的提案（replan 类）被采纳时，apply_proposal 已把参数写进 workspace.json，
+        # 这里同步 SQLite courses 索引表。
+        if proposal.get("params"):
+            with get_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE courses
+                    SET name = ?, exam_date = ?, target_score = ?, daily_hours = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        workspace["course"]["name"],
+                        workspace["course"]["examDate"],
+                        workspace["course"]["targetScore"],
+                        workspace["course"]["dailyHours"],
+                        course_id,
+                    ),
+                )
         if mark_strategy_maintenance_pending(course_id, "用户确认调整复习计划"):
             enqueue_agent_job(course_id, "maintain_review_plan", {"event": "用户确认调整复习计划"})
         return {"workspace": workspace, "proposal": proposal}
@@ -1299,6 +1561,19 @@ def update_runtime_model(payload: RuntimeModelUpdateRequest) -> dict[str, str | 
     if not payload.api_key.strip() and not get_runtime_model_api_key():
         raise HTTPException(status_code=422, detail="请先填写 API Key")
     return save_runtime_model_profile(base_url, payload.api_key, payload.model)
+
+
+@app.get("/api/user-profile")
+def user_profile_prompt() -> dict[str, str]:
+    return get_user_profile_prompt()
+
+
+@app.put("/api/user-profile")
+def update_user_profile_prompt(payload: UserProfilePromptUpdateRequest) -> dict[str, str]:
+    try:
+        return save_user_profile_prompt(payload.content)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.get("/api/knowledge/status")

@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 from ..agent_runtime import create_adjustment_proposal, get_adjustment_proposal, set_proposal_status
 from ..knowledge_service import learner_memory_context, retrieve_material_context
+from ..mcp_gateway import McpStdioClient, extract_arxiv_id, extract_mcp_text, validate_public_source_url
+from .. import study_scheduler
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -37,6 +39,78 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "focus": {"type": "string", "description": "希望聚焦的问题，可为空"},
                 },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_web_page",
+            "description": "使用 fetch-mcp 读取用户明确提供的公开网页 URL，并返回清洗后的 Markdown 文本。只在用户要求分析网页、链接或外部材料时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "公开 HTTP/HTTPS 网页地址"},
+                    "maxLength": {"type": "integer", "minimum": 1000, "maximum": 12000},
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "使用 Tavily MCP 联网搜索资料。用于用户没有提供明确网址、但要求查找外部网页资料、最新信息、教程或参考来源时。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词或问题"},
+                    "maxResults": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "searchDepth": {"type": "string", "enum": ["basic", "advanced", "fast", "ultra-fast"]},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_arxiv_papers",
+            "description": "使用 arXiv MCP 搜索学术论文。用于用户要求查论文、找综述、找某方向经典或近期论文时。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "论文搜索关键词，建议使用英文技术词或带引号的精确短语"},
+                    "maxResults": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 5,
+                        "description": "可选 arXiv 分类，如 cs.AI、cs.CL、cs.LG、cs.CV",
+                    },
+                    "sortBy": {"type": "string", "enum": ["relevance", "date"]},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_arxiv_paper",
+            "description": "使用 arXiv MCP 按 arXiv 论文 ID 或链接读取论文内容。读取英文论文后，应按用户要求用中文解释、摘要或翻译。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paperIdOrUrl": {"type": "string", "description": "arXiv ID，或 arxiv.org/abs、arxiv.org/pdf 链接"},
+                    "maxChars": {"type": "integer", "minimum": 2000, "maximum": 30000},
+                },
+                "required": ["paperIdOrUrl"],
                 "additionalProperties": False,
             },
         },
@@ -357,6 +431,15 @@ def apply_operations_to_copy(workspace: dict[str, Any], operations: list[dict[st
             raise ValueError(f"不支持的调整操作：{operation_type}")
     if should_reorder:
         tasks.sort(key=lambda item: (int(item.get("day", 99)), int(item.get("order", 999))))
+        dag_violations = study_scheduler.find_dag_violations(
+            tasks, workspace.get("knowledgePoints", [])
+        )
+        if dag_violations:
+            violation = dag_violations[0]
+            raise ValueError(
+                "调整违反前置依赖："
+                f"「{violation['taskTitle']}」需先完成【{'、'.join(violation['prerequisiteNames'])}】"
+            )
         for index, task in enumerate(tasks, start=1):
             task["order"] = index
     return tasks
@@ -427,6 +510,89 @@ def execute_agent_tool(
         limit = max(1, min(8, int(arguments.get("limit", 6))))
         result = retrieve_material_context(course_id, query, limit=limit)
         return {"items": result["items"], "semanticUsed": result["semanticUsed"]}
+    if name == "fetch_web_page":
+        url = validate_public_source_url(str(arguments.get("url", "")))
+        max_length = max(1000, min(12000, int(arguments.get("maxLength", 5000))))
+        client = McpStdioClient("npx", ["-y", "fetch-mcp"])
+        try:
+            result = client.call_tool(
+                "fetch_url",
+                {"url": url, "raw": False, "max_length": max_length, "start_index": 0},
+            )
+        finally:
+            client.close()
+        content, metadata = extract_mcp_text(result)
+        return {
+            "url": url,
+            "content": content[:max_length],
+            "characters": len(content),
+            "metadata": metadata,
+        }
+    if name == "search_web":
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            raise ValueError("联网搜索关键词不能为空")
+        max_results = max(1, min(8, int(arguments.get("maxResults", 5))))
+        search_depth = str(arguments.get("searchDepth") or "basic")
+        if search_depth not in {"basic", "advanced", "fast", "ultra-fast"}:
+            search_depth = "basic"
+        client = McpStdioClient("npx", ["-y", "tavily-mcp@latest"])
+        try:
+            result = client.call_tool(
+                "tavily_search",
+                {
+                    "query": query,
+                    "max_results": max_results,
+                    "search_depth": search_depth,
+                    "include_answer": True,
+                    "include_raw_content": False,
+                    "include_images": False,
+                },
+            )
+        finally:
+            client.close()
+        content, metadata = extract_mcp_text(result)
+        return {"query": query, "content": content[:24000], "metadata": metadata}
+    if name == "search_arxiv_papers":
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            raise ValueError("arXiv 搜索关键词不能为空")
+        max_results = max(1, min(10, int(arguments.get("maxResults", 5))))
+        categories = arguments.get("categories")
+        normalized_categories = [str(item).strip() for item in categories if str(item).strip()][:5] if isinstance(categories, list) else []
+        sort_by = str(arguments.get("sortBy") or "relevance")
+        if sort_by not in {"relevance", "date"}:
+            sort_by = "relevance"
+        client = McpStdioClient("uvx", ["arxiv-mcp-server"])
+        try:
+            result = client.call_tool(
+                "search_papers",
+                {
+                    "query": query,
+                    "max_results": max_results,
+                    "categories": normalized_categories,
+                    "sort_by": sort_by,
+                },
+            )
+        finally:
+            client.close()
+        content, metadata = extract_mcp_text(result)
+        return {"query": query, "content": content[:20000], "metadata": metadata}
+    if name == "read_arxiv_paper":
+        paper_id = extract_arxiv_id(str(arguments.get("paperIdOrUrl", "")))
+        max_chars = max(2000, min(30000, int(arguments.get("maxChars", 16000))))
+        client = McpStdioClient("uvx", ["arxiv-mcp-server"])
+        try:
+            result = client.call_tool("download_paper", {"paper_id": paper_id, "max_chars": max_chars})
+        finally:
+            client.close()
+        content, metadata = extract_mcp_text(result)
+        return {
+            "paperId": paper_id,
+            "content": content[:max_chars],
+            "characters": len(content),
+            "metadata": metadata,
+        }
 
     workspace = load_workspace(course_id)
     if name == "get_learning_state":
@@ -550,9 +716,29 @@ def apply_proposal(
         raise RuntimeError("提案已处理")
     workspace = load_workspace(course_id)
     current_revision = int(workspace.get("revision", 0))
-    if int(workspace.get("planRevision", 0)) != proposal["baseRevision"]:
-        raise RuntimeError("学习计划已发生变化，请重新生成调整提案")
+    # 不再用 planRevision 是否相等来硬性拒绝提案：学习计划在提案生成后会自然滚动
+    # （任务状态推进、Agent 自动维护等都会让 save_workspace 递增 planRevision），
+    # 导致提案的 baseRevision 很快过期、用户点「采纳」时永远命中此分支，
+    # 卡片始终点不动也不消失。真正决定提案能否应用的，是它引用的任务是否仍存在——
+    # 这由 apply_operations_to_copy 校验，任务缺失或参数非法时抛 ValueError（路由层映射为 409）。
     workspace["tasks"] = apply_operations_to_copy(workspace, proposal["operations"])
+
+    # 若提案携带参数变更（replan 类提案），在落 tasks 的同时一并把参数写入 workspace。
+    # SQLite courses 表的同步由 main.py 的 apply 路由负责，避免本层反向依赖 DB。
+    params = proposal.get("params") or {}
+    if params:
+        course = workspace.setdefault("course", {})
+        onboarding = workspace.setdefault("onboarding", {})
+        if params.get("examDate"):
+            course["examDate"] = params["examDate"]
+            onboarding["examDate"] = params["examDate"]
+        if params.get("dailyHours") is not None:
+            course["dailyHours"] = params["dailyHours"]
+            onboarding["dailyHours"] = params["dailyHours"]
+        if params.get("days") is not None:
+            onboarding["days"] = params["days"]
+        onboarding["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+
     save_workspace(workspace, course_id, current_revision)
     set_proposal_status(course_id, proposal_id, "applied")
     return workspace, get_adjustment_proposal(course_id, proposal_id)

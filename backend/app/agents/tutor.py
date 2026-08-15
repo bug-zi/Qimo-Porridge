@@ -102,6 +102,10 @@ def run_tutor_agent(
 
 TOOL_LABELS = {
     "search_materials": "正在检索课程资料…",
+    "fetch_web_page": "正在读取网页内容…",
+    "search_web": "正在联网搜索资料…",
+    "search_arxiv_papers": "正在搜索 arXiv 论文…",
+    "read_arxiv_paper": "正在读取 arXiv 论文…",
     "get_learning_state": "正在读取学习状态…",
     "propose_plan_change": "正在拟定调整提案…",
 }
@@ -114,6 +118,16 @@ def _tool_summary(name: str, result: dict[str, Any]) -> str:
         items = result.get("items")
         count = len(items) if isinstance(items, list) else 0
         return f"找到 {count} 条相关资料" if count else "未找到直接相关资料"
+    if name == "fetch_web_page":
+        characters = int(result.get("characters", 0))
+        return f"已读取 {characters} 字符网页内容" if characters else "网页内容已读取"
+    if name == "search_web":
+        return "联网搜索结果已返回"
+    if name == "search_arxiv_papers":
+        return "arXiv 搜索结果已返回"
+    if name == "read_arxiv_paper":
+        characters = int(result.get("characters", 0))
+        return f"已读取 {characters} 字符论文内容" if characters else "论文内容已读取"
     if name == "get_learning_state":
         return "学习状态已读取"
     if name == "propose_plan_change":

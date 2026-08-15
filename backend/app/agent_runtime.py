@@ -159,6 +159,17 @@ def initialize_agent_database() -> None:
             if column not in existing_columns:
                 connection.execute(f"ALTER TABLE mcp_servers ADD COLUMN {column} {definition}")
 
+        # adjustment_proposals 表：为「按新参数重新编排」类提案追加 params_json 列，
+        # 用于在用户「采纳」时一并落地 examDate/days/dailyHours（「忽略」则参数不落地，保持一致）。
+        existing_proposal_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(adjustment_proposals)").fetchall()
+        }
+        if "params_json" not in existing_proposal_columns:
+            connection.execute(
+                "ALTER TABLE adjustment_proposals ADD COLUMN params_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
 
 def create_agent_run(course_id: str, workflow: str, input_data: dict[str, Any] | None = None) -> str:
     initialize_agent_database()
@@ -450,6 +461,7 @@ def create_adjustment_proposal(
     before: dict[str, Any],
     after: dict[str, Any],
     source_run_id: str = "",
+    params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     initialize_agent_database()
     proposal_id = f"proposal-{uuid.uuid4().hex}"
@@ -458,8 +470,8 @@ def create_adjustment_proposal(
             """
             INSERT INTO adjustment_proposals (
                 id, course_id, status, base_revision, title, reason, impact,
-                operations_json, before_json, after_json, source_run_id, created_at
-            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                operations_json, before_json, after_json, source_run_id, params_json, created_at
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 proposal_id,
@@ -472,6 +484,7 @@ def create_adjustment_proposal(
                 json.dumps(before, ensure_ascii=False),
                 json.dumps(after, ensure_ascii=False),
                 source_run_id,
+                json.dumps(params or {}, ensure_ascii=False),
                 _now(),
             ),
         )
@@ -497,7 +510,35 @@ def get_adjustment_proposal(course_id: str, proposal_id: str) -> dict[str, Any]:
         "operations": json.loads(row["operations_json"]),
         "before": json.loads(row["before_json"]),
         "after": json.loads(row["after_json"]),
+        "params": json.loads(row["params_json"] or "{}"),
     }
+
+
+def list_pending_proposals(course_id: str) -> list[dict[str, Any]]:
+    """列出某课程下所有 pending 状态的调整提案，按创建时间倒序。"""
+    with _connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM adjustment_proposals WHERE course_id = ? AND status = 'pending' ORDER BY created_at DESC",
+            (course_id,),
+        ).fetchall()
+    proposals: list[dict[str, Any]] = []
+    for row in rows:
+        proposals.append(
+            {
+                "id": str(row["id"]),
+                "courseId": str(row["course_id"]),
+                "status": str(row["status"]),
+                "baseRevision": int(row["base_revision"]),
+                "title": str(row["title"]),
+                "reason": str(row["reason"]),
+                "impact": str(row["impact"]),
+                "operations": json.loads(row["operations_json"]),
+                "before": json.loads(row["before_json"]),
+                "after": json.loads(row["after_json"]),
+                "params": json.loads(row["params_json"] or "{}"),
+            }
+        )
+    return proposals
 
 
 def set_proposal_status(course_id: str, proposal_id: str, status: str) -> None:
@@ -511,6 +552,28 @@ def set_proposal_status(course_id: str, proposal_id: str, status: str) -> None:
         ).rowcount
     if not changed:
         raise RuntimeError("提案已处理或不存在")
+
+
+def last_proposal_resolution_at(course_id: str) -> str | None:
+    """最近一次被「采纳 / 忽略」的提案时间戳。
+
+    用于在用户刚处理完一条调整建议后，抑制「打开课程空间即自动再生成新提案」的循环——
+    否则只要计划仍超额/逾期，每次加载空间都会再补一条建议，看起来就像卡片永远不消失。
+    """
+    with _connection() as connection:
+        row = connection.execute(
+            """
+            SELECT applied_at, dismissed_at
+            FROM adjustment_proposals
+            WHERE course_id = ? AND status IN ('applied', 'dismissed')
+            ORDER BY COALESCE(applied_at, dismissed_at) DESC
+            LIMIT 1
+            """,
+            (course_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return row["applied_at"] or row["dismissed_at"]
 
 
 def create_external_source(course_id: str, url: str, source_type: str = "web") -> dict[str, Any]:

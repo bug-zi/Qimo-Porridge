@@ -88,7 +88,6 @@ def process_external_source_job(course_id: str, payload: dict[str, Any]) -> dict
             content_parts.extend(["## 复习要点", *[f"- {item}" for item in key_points]])
         if uncertainties:
             content_parts.extend(["## 待核验事项", *[f"- {item}" for item in uncertainties]])
-        content_parts.extend(["## MCP 提取原文", raw_content[:400_000]])
         content = "\n\n".join(part for part in content_parts if part)
         record_agent_step(
             run_id,

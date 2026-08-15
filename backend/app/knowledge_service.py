@@ -9,12 +9,18 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy 随 pandas 一起安装，正常环境必然存在
+    np = None  # type: ignore[assignment]
 
 
 DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
@@ -96,6 +102,7 @@ def initialize_knowledge_database() -> None:
                 external_id TEXT UNIQUE,
                 course_id TEXT NOT NULL,
                 role TEXT NOT NULL,
+                conversation_mode TEXT NOT NULL DEFAULT 'chat',
                 content TEXT NOT NULL,
                 sources_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL
@@ -150,8 +157,30 @@ def initialize_knowledge_database() -> None:
                 completed_at TEXT NOT NULL,
                 PRIMARY KEY (course_id, task_id, section_index)
             );
+
+            -- 分层对话记忆：把已被压缩的早期对话区间持久化为脉络摘要，
+            -- 配合 recent_chat_messages（近期原文窗口）与 related_chat_history（相关性检索）使用。
+            CREATE TABLE IF NOT EXISTS chat_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                course_id TEXT NOT NULL,
+                conversation_mode TEXT NOT NULL DEFAULT 'chat',
+                content TEXT NOT NULL,
+                from_turn_id INTEGER NOT NULL,
+                to_turn_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_summaries_course
+                ON chat_summaries (course_id, conversation_mode, id DESC);
             """
         )
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(chat_turns)").fetchall()
+        }
+        if "conversation_mode" not in columns:
+            connection.execute(
+                "ALTER TABLE chat_turns ADD COLUMN conversation_mode TEXT NOT NULL DEFAULT 'chat'"
+            )
         try:
             connection.execute(
                 """
@@ -176,6 +205,17 @@ def initialize_knowledge_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model
                 ON chunk_embeddings (model);
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+                memory_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (memory_id, model)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model
+                ON memory_embeddings (model);
             """
         )
 
@@ -609,6 +649,7 @@ def sync_material_documents(course_id: str, documents: list[dict[str, str]]) -> 
                 "DELETE FROM chunk_embeddings WHERE chunk_id = ?",
                 [(chunk_id,) for chunk_id in removed_chunk_ids],
             )
+        _invalidate_vector_cache()
     return {"materials": len(normalized_documents), "chunks": chunk_count, "changed": changed_count}
 
 
@@ -656,6 +697,7 @@ def rebuild_course_embeddings(course_id: str) -> dict[str, Any]:
                     for row, vector in zip(batch, vectors, strict=True)
                 ],
             )
+    _invalidate_vector_cache(model)
     status = get_embedding_status(probe=False)
     return {
         **status,
@@ -735,6 +777,126 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return numerator / (left_norm * right_norm)
 
 
+_VECTOR_MATRIX_TTL = 300.0
+_VECTOR_MATRIX_CACHE: dict[str, "_VectorMatrix"] = {}
+_VECTOR_CACHE_LOCK = threading.Lock()
+
+
+@dataclass
+class _VectorMatrix:
+    """已 L2 归一化的向量矩阵缓存，余弦相似度退化为点积。"""
+
+    chunk_ids: list[str]
+    chunk_id_to_index: dict[str, int]
+    matrix: Any  # numpy.ndarray, shape (N, D)
+    loaded_at: float
+
+
+def _invalidate_vector_cache(model: str | None = None) -> None:
+    """写入 chunk_embeddings 后调用，保证下次检索读到最新向量。"""
+    with _VECTOR_CACHE_LOCK:
+        if model is None:
+            _VECTOR_MATRIX_CACHE.clear()
+        else:
+            _VECTOR_MATRIX_CACHE.pop(model, None)
+
+
+def _build_vector_matrix(model: str) -> _VectorMatrix | None:
+    if np is None:
+        return None
+    with _embedding_connection() as connection:
+        rows = connection.execute(
+            "SELECT chunk_id, vector_json FROM chunk_embeddings WHERE model = ?",
+            (model,),
+        ).fetchall()
+    chunk_ids: list[str] = []
+    vectors: list[list[float]] = []
+    for row in rows:
+        try:
+            vector = json.loads(row["vector_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(vector, list) or not vector:
+            continue
+        chunk_ids.append(str(row["chunk_id"]))
+        vectors.append([float(value) for value in vector])
+    if not chunk_ids:
+        return None
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    matrix = matrix / norms  # L2 归一化后余弦相似度 == 点积，避免每次检索重复归一化
+    chunk_id_to_index = {chunk_id: index for index, chunk_id in enumerate(chunk_ids)}
+    return _VectorMatrix(
+        chunk_ids=chunk_ids,
+        chunk_id_to_index=chunk_id_to_index,
+        matrix=matrix,
+        loaded_at=time.monotonic(),
+    )
+
+
+def _get_vector_matrix(model: str) -> _VectorMatrix | None:
+    """获取该模型的向量矩阵，命中缓存直接返回；miss 时加锁构建。"""
+    cached = _VECTOR_MATRIX_CACHE.get(model)
+    if cached is not None and time.monotonic() - cached.loaded_at < _VECTOR_MATRIX_TTL:
+        return cached
+    with _VECTOR_CACHE_LOCK:
+        cached = _VECTOR_MATRIX_CACHE.get(model)
+        if cached is not None and time.monotonic() - cached.loaded_at < _VECTOR_MATRIX_TTL:
+            return cached
+        matrix = _build_vector_matrix(model)
+        if matrix is not None:
+            _VECTOR_MATRIX_CACHE[model] = matrix
+        else:
+            _VECTOR_MATRIX_CACHE.pop(model, None)
+        return matrix
+
+
+def _score_semantic_vectors(
+    model: str,
+    query_vector: list[float],
+    course_ids: set[str],
+) -> list[tuple[float, str]]:
+    """对课程范围内的 chunk 计算余弦相似度，返回 (score, chunk_id) 未排序列表。
+
+    优先走 numpy 向量化 + 进程内矩阵缓存（O(M·D)，M 为课程 chunk 数）；
+    numpy 不可用时回退到逐条 Python 计算。原实现每次检索都把全表向量
+    json.loads 进内存逐条算余弦，资料变多后是明显瓶颈。
+    """
+    vector_matrix = _get_vector_matrix(model)
+    if vector_matrix is not None and np is not None and query_vector:
+        mapping = vector_matrix.chunk_id_to_index
+        indices = [mapping[cid] for cid in course_ids if cid in mapping]
+        if not indices:
+            return []
+        query = np.asarray(query_vector, dtype=np.float32)
+        query_norm = np.linalg.norm(query)
+        if query_norm > 0:
+            query = query / query_norm
+        # 只取课程子集做矩阵向量乘，避免对其他课程做无效计算
+        scores = vector_matrix.matrix[indices] @ query
+        chunk_ids = vector_matrix.chunk_ids
+        return [
+            (float(scores[position]), chunk_ids[indices[position]])
+            for position in range(len(indices))
+        ]
+
+    course_id_set = course_ids
+    with _embedding_connection() as connection:
+        vector_rows = connection.execute(
+            "SELECT chunk_id, vector_json FROM chunk_embeddings WHERE model = ?",
+            (model,),
+        ).fetchall()
+    scored: list[tuple[float, str]] = []
+    for vector_row in vector_rows:
+        chunk_id = str(vector_row["chunk_id"])
+        if chunk_id not in course_id_set:
+            continue
+        vector = json.loads(vector_row["vector_json"])
+        scored.append((_cosine_similarity(query_vector, vector), chunk_id))
+    return scored
+
+
 def retrieve_material_context(course_id: str, query: str, *, limit: int = 6) -> dict[str, Any]:
     global _EMBEDDING_UNAVAILABLE_UNTIL
     initialize_knowledge_database()
@@ -757,18 +919,9 @@ def retrieve_material_context(course_id: str, query: str, *, limit: int = 6) -> 
                 ).fetchall()
             course_ids = {str(row["id"]) for row in course_rows}
             row_by_id.update({str(row["id"]): row for row in course_rows})
-            with _embedding_connection() as connection:
-                vector_rows = connection.execute(
-                    "SELECT chunk_id, vector_json FROM chunk_embeddings WHERE model = ?",
-                    (str(config["model"]),),
-                ).fetchall()
-            scored_vectors = []
-            for vector_row in vector_rows:
-                chunk_id = str(vector_row["chunk_id"])
-                if chunk_id not in course_ids:
-                    continue
-                vector = json.loads(vector_row["vector_json"])
-                scored_vectors.append((_cosine_similarity(query_vector, vector), chunk_id))
+            scored_vectors = _score_semantic_vectors(
+                str(config["model"]), query_vector, course_ids
+            )
             scored_vectors.sort(reverse=True)
             for rank, (_, chunk_id) in enumerate(scored_vectors[:30], start=1):
                 ranks[chunk_id] = ranks.get(chunk_id, 0) + 1 / (60 + rank)
@@ -802,22 +955,25 @@ def record_chat_turn(
     role: str,
     content: str,
     *,
+    mode: str = "chat",
     external_id: str = "",
     sources: list[dict[str, Any]] | None = None,
     created_at: str | None = None,
 ) -> None:
     initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
     with _database_connection() as connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO chat_turns (
-                external_id, course_id, role, content, sources_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                external_id, course_id, role, conversation_mode, content, sources_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 external_id or None,
                 course_id,
                 role,
+                conversation_mode,
                 content,
                 json.dumps(sources or [], ensure_ascii=False),
                 created_at or _now(),
@@ -835,19 +991,167 @@ def import_workspace_messages(course_id: str, messages: list[dict[str, Any]]) ->
                 course_id,
                 str(message["role"]),
                 content,
+                mode=str(message.get("mode") or "chat"),
                 external_id=str(message.get("id", "")),
                 created_at=str(message.get("createdAt") or _now()),
             )
 
 
-def recent_chat_messages(course_id: str, *, limit: int = 8) -> list[dict[str, str]]:
+def recent_chat_messages(course_id: str, *, mode: str = "chat", limit: int = 8) -> list[dict[str, str]]:
     initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
     with _database_connection() as connection:
         rows = connection.execute(
-            "SELECT role, content FROM chat_turns WHERE course_id = ? ORDER BY id DESC LIMIT ?",
-            (course_id, limit),
+            """
+            SELECT role, content
+            FROM chat_turns
+            WHERE course_id = ? AND conversation_mode = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (course_id, conversation_mode, limit),
         ).fetchall()
     return [{"role": str(row["role"]), "content": str(row["content"])} for row in reversed(rows)]
+
+
+def latest_summarized_turn_id(course_id: str, *, mode: str = "chat") -> int:
+    """已压缩区间的最大 chat_turns.id；尚无摘要时返回 0。"""
+    initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT MAX(to_turn_id) AS latest FROM chat_summaries WHERE course_id = ? AND conversation_mode = ?",
+            (course_id, conversation_mode),
+        ).fetchone()
+    return int(row["latest"] or 0)
+
+
+def unsummarized_chat_turns(
+    course_id: str, *, mode: str = "chat", after_turn_id: int = 0
+) -> list[dict[str, Any]]:
+    """返回 id > after_turn_id 的全部对话原文（id 升序），供滚动摘要压缩。"""
+    initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
+    with _database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, role, content
+            FROM chat_turns
+            WHERE course_id = ? AND conversation_mode = ? AND id > ?
+            ORDER BY id ASC
+            """,
+            (course_id, conversation_mode, after_turn_id),
+        ).fetchall()
+    return [
+        {"id": int(row["id"]), "role": str(row["role"]), "content": str(row["content"])}
+        for row in rows
+    ]
+
+
+def record_chat_summary(
+    course_id: str,
+    content: str,
+    from_turn_id: int,
+    to_turn_id: int,
+    *,
+    mode: str = "chat",
+) -> None:
+    """持久化一段对话脉络摘要，并记录其覆盖的原始 turn id 区间。"""
+    initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
+    with _database_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO chat_summaries (
+                course_id, conversation_mode, content, from_turn_id, to_turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (course_id, conversation_mode, content, from_turn_id, to_turn_id, _now()),
+        )
+
+
+def get_rolling_summaries(course_id: str, *, mode: str = "chat") -> list[str]:
+    """返回全部已存脉络摘要（时间升序），用于拼成早期对话背景。"""
+    initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
+    with _database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT content
+            FROM chat_summaries
+            WHERE course_id = ? AND conversation_mode = ?
+            ORDER BY id ASC
+            """,
+            (course_id, conversation_mode),
+        ).fetchall()
+    return [str(row["content"]) for row in rows]
+
+
+def related_chat_history(
+    course_id: str,
+    query: str,
+    *,
+    mode: str = "chat",
+    limit: int = 4,
+    exclude_recent: int = 8,
+) -> list[dict[str, str]]:
+    """按当前 query 的词法相关性，从早期历史（排除近期窗口）捞回最相关的片段。
+
+    近期窗口原文已由 recent_chat_messages 提供，这里刻意排除最近 exclude_recent 条，
+    避免重复，确保捞回的是更早的对话脉络。最终按 id 升序输出以保持时序。
+    """
+    initialize_knowledge_database()
+    conversation_mode = "agent" if mode == "agent" else "chat"
+    terms = _query_terms(query)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, role, content
+            FROM chat_turns
+            WHERE course_id = ? AND conversation_mode = ?
+            ORDER BY id DESC
+            """,
+            (course_id, conversation_mode),
+        ).fetchall()
+    candidates = rows[exclude_recent:]
+    if not candidates or not terms:
+        return []
+    scored: list[tuple[float, int, sqlite3.Row]] = []
+    for row in candidates:
+        lowered = str(row["content"]).lower()
+        score = sum((3 if term in lowered else 0) + lowered.count(term) for term in terms)
+        if score:
+            scored.append((score, int(row["id"]), row))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    picked = sorted(scored[:limit], key=lambda item: item[1])
+    return [
+        {"role": str(row["role"]), "content": str(row["content"])}
+        for _, _, row in picked
+    ]
+
+
+def build_conversation_memory(
+    course_id: str, query: str, *, mode: str = "chat"
+) -> dict[str, Any]:
+    """分层对话记忆：近期原文窗口 + 早期滚动摘要 + 相关性检索片段。
+
+    - recent：最近 8 条原文，保证多轮工具调用的逐字连贯。
+    - summary_text：已被压缩的早期对话脉络（多段摘要拼接），可能为空。
+    - related_text：与当前 query 相关的早期原文片段，可能为空。
+    """
+    recent = recent_chat_messages(course_id, mode=mode, limit=8)
+    summaries = get_rolling_summaries(course_id, mode=mode)
+    summary_text = "\n".join(f"- {item}" for item in summaries).strip() if summaries else ""
+    related = related_chat_history(course_id, query, mode=mode, limit=4, exclude_recent=8)
+    related_text = (
+        "\n".join(
+            f"{'用户' if item['role'] == 'user' else 'AI'}：{item['content']}"
+            for item in related
+        ).strip()
+        if related
+        else ""
+    )
+    return {"recent": recent, "summary_text": summary_text, "related_text": related_text}
 
 
 def upsert_learner_memory(
@@ -893,6 +1197,8 @@ def upsert_learner_memory(
             "INSERT OR IGNORE INTO memory_evidence (memory_id, evidence_type, evidence_id, created_at) VALUES (?, ?, ?, ?)",
             (memory_id, source_type, evidence_id, timestamp),
         )
+    # best-effort 为该条记忆计算并持久化向量；embedding 关闭或不可用时静默跳过，不影响记忆写入。
+    _ensure_memory_embedding(memory_id, normalized)
     return memory_id
 
 
@@ -942,7 +1248,74 @@ def record_learning_event(
     return event_id
 
 
+def _load_memory_vectors(memory_ids: list[str], model: str) -> dict[str, list[float]]:
+    """批量读取记忆向量。memory_ids 来自主库、向量在 embedding 库，跨库不能 JOIN，故分两步查。"""
+    if not memory_ids:
+        return {}
+    placeholders = ",".join("?" for _ in memory_ids)
+    with _embedding_connection() as connection:
+        rows = connection.execute(
+            f"SELECT memory_id, vector_json FROM memory_embeddings WHERE model = ? AND memory_id IN ({placeholders})",
+            (model, *memory_ids),
+        ).fetchall()
+    vectors: dict[str, list[float]] = {}
+    for row in rows:
+        try:
+            vectors[str(row["memory_id"])] = json.loads(row["vector_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return vectors
+
+
+def _ensure_memory_embedding(memory_id: str, content: str) -> None:
+    """best-effort 为单条记忆计算并持久化向量。
+
+    embedding 关闭、熔断期或服务异常时静默跳过——记忆本体已写入，向量缺失只会让检索
+    回退到词法打分（learner_memory_context 对缺失向量自然降级），不影响功能。
+    """
+    config = _read_embedding_config()
+    if not config.get("enabled"):
+        return
+    if time.monotonic() < _EMBEDDING_UNAVAILABLE_UNTIL:
+        return  # 检索路径已探明不可用，写入路径不再重试，避免每次 upsert 都探测
+    model = str(config["model"])
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    with _embedding_connection() as connection:
+        cached = connection.execute(
+            "SELECT content_hash FROM memory_embeddings WHERE memory_id = ? AND model = ?",
+            (memory_id, model),
+        ).fetchone()
+        if cached and cached["content_hash"] == content_hash:
+            return  # 内容未变，复用已有向量，避免重复 embed
+    try:
+        vector = _request_embeddings([content])[0]
+    except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return
+    with _embedding_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO memory_embeddings (
+                memory_id, model, content_hash, dimension, vector_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                model,
+                content_hash,
+                len(vector),
+                json.dumps(vector, separators=(",", ":")),
+                _now(),
+            ),
+        )
+
+
 def learner_memory_context(course_id: str, query: str, *, limit: int = 5) -> str:
+    """检索长期记忆：词法 + 置信度 + 时近 基础分，embedding 启用时叠加语义相似度。
+
+    与资料检索 retrieve_material_context 架构一致（混合打分 + 熔断）；embedding 关闭或不可用时
+    优雅回退到纯词法打分（旧行为），避免记忆累积后同义不同词的表述无法被召回、质量下滑。
+    """
+    global _EMBEDDING_UNAVAILABLE_UNTIL
     terms = _query_terms(query)
     with _database_connection() as connection:
         rows = connection.execute(
@@ -953,14 +1326,39 @@ def learner_memory_context(course_id: str, query: str, *, limit: int = 5) -> str
             """,
             (course_id,),
         ).fetchall()
-    scored = []
+    if not rows:
+        return ""
+
+    # 基础分（旧行为）：词法命中 *10 + 置信度 + 时近。保证无 embedding 时仍可召回。
+    scores: dict[str, float] = {}
+    content_by_id: dict[str, str] = {}
     for recency, row in enumerate(rows):
-        content = str(row["content"]).lower()
-        lexical = sum(content.count(term) for term in terms)
-        score = lexical * 10 + float(row["confidence"]) + 1 / (recency + 1)
-        scored.append((score, row))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return "\n".join(f"- {row['content']}" for _, row in scored[:limit])
+        memory_id = str(row["id"])
+        lowered = str(row["content"]).lower()
+        content_by_id[memory_id] = str(row["content"])
+        lexical = sum(lowered.count(term) for term in terms)
+        scores[memory_id] = lexical * 10 + float(row["confidence"]) + 1 / (recency + 1)
+
+    # 语义增强：覆盖词法盲区（同义不同词）。缺失向量的记忆自然跳过，不影响其基础分。
+    config = _read_embedding_config()
+    if config.get("enabled") and time.monotonic() >= _EMBEDDING_UNAVAILABLE_UNTIL:
+        try:
+            query_vector = _request_embeddings([query])[0]
+            vectors = _load_memory_vectors(list(content_by_id), str(config["model"]))
+            if vectors:
+                semantic_ranked = sorted(
+                    ((_cosine_similarity(query_vector, vec), mid) for mid, vec in vectors.items()),
+                    reverse=True,
+                )
+                for similarity, memory_id in semantic_ranked:
+                    # sim∈[-1,1] 截断到 [0,1] 后乘 10，与单个词法命中量级相当：
+                    # 既能召回同义记忆，又不会淹没词法强命中与置信度。
+                    scores[memory_id] = scores.get(memory_id, 0.0) + max(0.0, similarity) * 10
+        except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            _EMBEDDING_UNAVAILABLE_UNTIL = time.monotonic() + 30
+
+    ranked_ids = sorted(content_by_id, key=lambda mid: scores[mid], reverse=True)[:limit]
+    return "\n".join(f"- {content_by_id[mid]}" for mid in ranked_ids)
 
 
 def record_review_progress(

@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import sqlite3
@@ -22,8 +23,32 @@ DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
 DATABASE_PATH = DATA_DIRECTORY / "exam_booster.db"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 MCP_STDIO_TIMEOUT_SECONDS = 120
-ALLOWED_STDIO_COMMANDS = {"npx", "npx.cmd", "node", "node.exe", "bunx", "bunx.cmd"}
+ALLOWED_STDIO_COMMANDS = {"npx", "npx.cmd", "node", "node.exe", "bunx", "bunx.cmd", "uvx", "uvx.exe"}
 MCP_PRESETS = (
+    {
+        "id": "mcp-arxiv",
+        "name": "arXiv MCP",
+        "transport": "stdio",
+        "command": "uvx",
+        "args": ["arxiv-mcp-server"],
+        "allowedTools": ["get_abstract", "read_paper"],
+    },
+    {
+        "id": "mcp-firecrawl",
+        "name": "Firecrawl MCP",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "firecrawl-mcp"],
+        "allowedTools": ["firecrawl_scrape"],
+    },
+    {
+        "id": "mcp-gitmcp",
+        "name": "GitMCP（GitHub）",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "mcp-remote", "https://gitmcp.io/idosal/git-mcp"],
+        "allowedTools": ["fetch_repository_documentation", "fetch_generic_url_content"],
+    },
     {
         "id": "mcp-bilibili",
         "name": "Bilibili MCP",
@@ -41,6 +66,23 @@ MCP_PRESETS = (
         "allowedTools": ["xhs_get_note"],
     },
 )
+
+
+def _read_backend_env_value(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return ""
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, raw_value = stripped.split("=", 1)
+        if key.strip() == name:
+            return raw_value.strip().strip('"').strip("'")
+    return ""
 
 
 @contextmanager
@@ -77,7 +119,7 @@ def _validate_stdio_command(command: str, args: list[str]) -> tuple[str, list[st
     normalized_command = command.strip()
     command_name = Path(normalized_command).name.lower()
     if command_name not in ALLOWED_STDIO_COMMANDS:
-        raise ValueError("stdio MCP 仅允许使用 npx、node 或 bunx 启动")
+        raise ValueError("stdio MCP 仅允许使用 npx、node、bunx 或 uvx 启动")
     normalized_args = [str(item).strip() for item in args if str(item).strip()]
     if len(normalized_args) > 20 or any(len(item) > 500 for item in normalized_args):
         raise ValueError("stdio MCP 启动参数过多或过长")
@@ -178,6 +220,15 @@ def seed_mcp_presets() -> None:
                     timestamp,
                 ),
             )
+            if preset["id"] == "mcp-arxiv":
+                connection.execute(
+                    """
+                    UPDATE mcp_servers
+                    SET allowed_tools_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(preset["allowedTools"], ensure_ascii=False), timestamp, preset["id"]),
+                )
 
 
 def get_mcp_server(server_id: str) -> dict[str, Any]:
@@ -295,6 +346,11 @@ class McpStdioClient:
         if not executable:
             raise RuntimeError(f"未找到 MCP 启动命令：{command}，请先安装 Node.js 18+")
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        environment = os.environ.copy()
+        if "tavily" in " ".join([command, *args]).lower() and not environment.get("TAVILY_API_KEY"):
+            tavily_api_key = _read_backend_env_value("TAVILY_API_KEY")
+            if tavily_api_key:
+                environment["TAVILY_API_KEY"] = tavily_api_key
         self.process = subprocess.Popen(
             [executable, *args],
             stdin=subprocess.PIPE,
@@ -305,6 +361,7 @@ class McpStdioClient:
             errors="replace",
             bufsize=1,
             creationflags=creation_flags,
+            env=environment,
         )
         self.request_id = 0
         self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -430,6 +487,10 @@ def call_mcp_tool(server_id: str, tool_name: str, arguments: dict[str, Any]) -> 
     allowed_tools = server["allowedTools"]
     if tool_name not in allowed_tools:
         raise PermissionError(f"MCP 工具未获授权：{tool_name}")
+    if server_id == "mcp-gitmcp":
+        return _call_gitmcp_tool(server, tool_name, arguments)
+    if server_id == "mcp-arxiv":
+        return _call_arxiv_tool(server, tool_name, arguments)
     client = _create_mcp_client(server)
     try:
         return client.call_tool(tool_name, arguments)
@@ -437,7 +498,102 @@ def call_mcp_tool(server_id: str, tool_name: str, arguments: dict[str, Any]) -> 
         client.close()
 
 
+def _github_repo_remote_url(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "github.com":
+        raise ValueError("GitMCP 仅支持 github.com 仓库地址")
+    path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(path_parts) < 2:
+        raise ValueError("GitHub 地址需包含 owner/repo")
+    owner = path_parts[0].strip()
+    repo = path_parts[1].strip().removesuffix(".git")
+    if not owner or not repo or owner.startswith(".") or repo.startswith("."):
+        raise ValueError("GitHub 仓库地址无效")
+    return f"https://gitmcp.io/{owner}/{repo}"
+
+
+def _github_readable_content_url(url: str) -> str:
+    parsed = urlparse(url)
+    path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+    owner = path_parts[0].strip()
+    repo = path_parts[1].strip().removesuffix(".git")
+    if len(path_parts) >= 5 and path_parts[2] == "blob":
+        branch = path_parts[3]
+        file_path = "/".join(path_parts[4:])
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/README.md"
+
+
+def extract_arxiv_id(value: str) -> str:
+    normalized = value.strip()
+    parsed = urlparse(normalized)
+    if parsed.scheme in {"http", "https"}:
+        hostname = (parsed.hostname or "").lower()
+        if not hostname.endswith("arxiv.org"):
+            raise ValueError("arXiv MCP 仅支持 arxiv.org 地址或 arXiv 论文 ID")
+        path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 2 and path_parts[0] in {"abs", "pdf"}:
+            normalized = path_parts[1].removesuffix(".pdf")
+        else:
+            raise ValueError("arXiv 地址需为 /abs/{paper_id} 或 /pdf/{paper_id}")
+    normalized = normalized.removesuffix(".pdf")
+    if not re.fullmatch(r"(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7}(?:v\d+)?)", normalized):
+        raise ValueError("arXiv 论文 ID 格式无效")
+    return normalized
+
+
+def _call_gitmcp_tool(server: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    remote_url = str(arguments.get("_gitmcpRemoteUrl") or "").strip()
+    if not remote_url:
+        raise ValueError("缺少 GitMCP 仓库地址")
+    client = McpStdioClient(server["command"], ["-y", "mcp-remote", remote_url])
+    try:
+        if tool_name == "fetch_repository_documentation":
+            content_url = str(arguments.get("_gitmcpContentUrl") or "").strip()
+            if not content_url:
+                raise ValueError("缺少 GitHub 可读取内容地址")
+            return client.call_tool("fetch_generic_url_content", {"url": content_url})
+        return client.call_tool(
+            tool_name,
+            {key: value for key, value in arguments.items() if not key.startswith("_gitmcp")},
+        )
+    finally:
+        client.close()
+
+
+def _call_arxiv_tool(server: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    client = _create_mcp_client(server)
+    try:
+        try:
+            return client.call_tool(tool_name, arguments)
+        except RuntimeError as error:
+            if tool_name != "read_paper" or "download_paper" not in str(error):
+                raise
+            return client.call_tool("download_paper", arguments)
+    finally:
+        client.close()
+
+
 def build_source_tool_arguments(server_id: str, tool_name: str, url: str) -> dict[str, Any]:
+    if server_id == "mcp-arxiv":
+        paper_id = extract_arxiv_id(url)
+        if tool_name in {"read_paper", "get_abstract"}:
+            arguments: dict[str, Any] = {"paper_id": paper_id}
+            if tool_name == "read_paper":
+                arguments["max_chars"] = 200_000
+            return arguments
+        raise ValueError(f"无法将 arXiv 资料网址映射到 MCP 工具参数：{tool_name}")
+    if server_id == "mcp-firecrawl" and tool_name == "firecrawl_scrape":
+        return {"url": url, "formats": ["markdown"], "onlyMainContent": True}
+    if server_id == "mcp-gitmcp":
+        remote_url = _github_repo_remote_url(url)
+        content_url = _github_readable_content_url(url)
+        if tool_name == "fetch_repository_documentation":
+            return {"_gitmcpRemoteUrl": remote_url, "_gitmcpContentUrl": content_url, "_originalUrl": url}
+        if tool_name == "fetch_generic_url_content":
+            return {"_gitmcpRemoteUrl": remote_url, "url": content_url}
+        raise ValueError(f"无法将 GitHub 资料网址映射到 MCP 工具参数：{tool_name}")
     if server_id == "mcp-bilibili":
         arguments: dict[str, Any] = {"bvid_or_url": url}
         if tool_name == "get_video_transcript":
@@ -493,4 +649,13 @@ def extract_mcp_text(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     content = "\n\n".join(texts).strip()
     if not content:
         raise RuntimeError("MCP 工具没有返回可导入的文本内容")
+    try:
+        parsed_content = json.loads(content)
+    except json.JSONDecodeError:
+        parsed_content = None
+    if isinstance(parsed_content, dict) and isinstance(parsed_content.get("content"), str):
+        metadata = dict(parsed_content)
+        extracted_content = str(metadata.pop("content")).strip()
+        if extracted_content:
+            return extracted_content, metadata
     return content, structured if isinstance(structured, dict) else {}
