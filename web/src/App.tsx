@@ -11,7 +11,6 @@ import {
 } from 'react'
 import {
   ArrowUp,
-  Bell,
   BookOpen,
   Check,
   ChevronDown,
@@ -29,12 +28,18 @@ import {
   X,
 } from 'lucide-react'
 import {
+  adjustCoursePlan,
   applyCourseAdjustmentProposal,
   askCourseAgent,
+  streamCourseAgent,
+  type AgentStreamHandle,
   approveStrategyDocumentsInBackground,
+  clearCourseMockResult,
+  clearCoursePracticeAnswer,
   createCourse,
   deleteCourse,
   deleteCourseMaterial,
+  deleteCourseTimeLog,
   deleteCourseWrongAnswer,
   dismissCourseAdjustmentProposal,
   generateStrategyDocuments,
@@ -44,6 +49,7 @@ import {
   getRuntimeModel,
   listArchiveItems,
   listCourses,
+  recordCourseTimeLog,
   rescanCourseMaterials,
   restoreArchiveItem,
   searchCourse,
@@ -55,20 +61,30 @@ import {
   submitCourseWrongAnswerRetry,
   toRuntimeModelProfile,
   updateCourseWorkspace,
+  flushCourseWorkspaceNote,
   uploadCourseMaterials,
 } from './api'
 import { AiCompanion } from './components/AiCompanion'
 import { MainNavigation } from './components/Sidebar'
+import { OptionWheel } from './components/OptionWheel'
 import { ModuleView } from './components/ModuleView'
+import { SelectionToNoteToolbar } from './components/SelectionToNoteToolbar'
+import { TopbarCourseTimer } from './components/TopbarCourseTimer'
+import { CourseTimerProvider } from './hooks/useCourseTimer'
+import { useSpecularButtons } from './hooks/useSpecularButtons'
+import { buildCourseTimeline, summarizeTimeline, COURSE_CATEGORY_TABS, type CourseTimelineCategory } from './utils/courseTimeline'
 import type {
   AdjustmentProposal,
   AgentJob,
   ArchiveItem,
   Course,
   LearningModule,
+  MockAnswer,
   ModelProfile,
+  PlanParamsAdjustRequest,
   PlanTask,
   SearchResult,
+  StreamingMessage,
   StudyWorkspace,
   UiFont,
   UiFontSize,
@@ -111,6 +127,7 @@ const initialNewCourseForm: NewCourseForm = {
 
 const uiFontStorageKey = 'final-congee-ui-font'
 const uiFontSizeStorageKey = 'final-congee-ui-font-size'
+const activeCourseStorageKey = 'final-congee-active-course'
 const aiPanelMinWidth = 280
 const aiPanelMaxWidth = 620
 const aiPanelDockedBreakpoint = 1180
@@ -217,6 +234,39 @@ function CourseSwitcher({
   onDeleteCourse,
   onNewCourse,
 }: CourseSwitcherProps) {
+  const [focusedId, setFocusedId] = useState(activeCourse.id)
+  // 当前查看的课程分类：默认「备考」，每次打开切换器回到「备考」。
+  const [activeTab, setActiveTab] = useState<CourseTimelineCategory>('active')
+
+  // 外部 active 变化时，滚轮居中回到当前课程。
+  useEffect(() => {
+    setFocusedId(activeCourse.id)
+  }, [activeCourse.id])
+
+  // 每次打开切换器默认显示「备考」课程。
+  useEffect(() => {
+    if (isOpen) setActiveTab('active')
+  }, [isOpen])
+
+  // 按考试时间分成「备考 / 历史」两类并排序：备考在前（升序），历史在后（降序）。
+  const timeline = useMemo(() => buildCourseTimeline(courses), [courses])
+  const categoryCounts = useMemo(() => summarizeTimeline(timeline), [timeline])
+  // 仅展示当前选中分类的课程。
+  const ordered = useMemo(
+    () => timeline.filter((entry) => entry.category === activeTab).map((entry) => entry.course),
+    [timeline, activeTab],
+  )
+
+  // 切换分类或删除当前预览项后，焦点落回 active 课程或该分类首门，避免滚轮指向不存在的项。
+  useEffect(() => {
+    if (ordered.length === 0) return
+    if (ordered.some((c) => c.id === focusedId)) return
+    setFocusedId(ordered.some((c) => c.id === activeCourse.id) ? activeCourse.id : ordered[0].id)
+  }, [ordered, focusedId, activeCourse.id])
+
+  const safeIndex = Math.max(0, ordered.findIndex((c) => c.id === focusedId))
+  const focused = ordered[safeIndex]
+
   return (
     <div className={`course-switcher ${isOpen ? 'is-open' : ''}`} ref={menuRef}>
       <button
@@ -234,38 +284,84 @@ function CourseSwitcher({
 
       {isOpen && (
         <section className="course-switcher-menu" role="menu" aria-label="课程列表">
-          <div className="course-switcher-list">
-            {courses.map((course) => {
-              const isSelected = course.id === activeCourse.id
-              return (
-                <div className={`course-switcher-row ${isSelected ? 'is-selected' : ''}`} key={course.id}>
-                  <button
-                    className="course-switcher-option"
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={isSelected}
-                    onClick={() => onSelectCourse(course)}
-                  >
-                    <span className="course-switcher-dot"></span>
-                    <span className="course-switcher-copy">
-                      <strong>{course.name}</strong>
-                      <small>{course.examDate} · 目标 {course.targetScore} 分 · 每日 {course.dailyHours}h</small>
-                    </span>
-                    {isSelected && <Check size={15} />}
-                  </button>
-                  <button
-                    className="course-switcher-delete"
-                    type="button"
-                    title={`删除 ${course.name}`}
-                    aria-label={`删除 ${course.name}`}
-                    onClick={() => onDeleteCourse(course)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
+          {timeline.length === 0 ? (
+            <div className="course-switcher-empty">还没有课程，添加一门开始吧</div>
+          ) : (
+            <>
+              <div className="course-category-tabs" role="tablist" aria-label="课程分类">
+                {COURSE_CATEGORY_TABS.map((tab) => {
+                  const count = categoryCounts[tab.key]
+                  const isActive = activeTab === tab.key
+                  return (
+                    <button
+                      key={tab.key}
+                      type="button"
+                      role="tab"
+                      aria-selected={isActive}
+                      data-status={tab.key}
+                      className={`course-category-tab${isActive ? ' is-active' : ''}`}
+                      onClick={() => setActiveTab(tab.key)}
+                      disabled={count === 0 && !isActive}
+                    >
+                      <span>{tab.label}</span>
+                      <small>{count}</small>
+                    </button>
+                  )
+                })}
+              </div>
+
+              {ordered.length === 0 ? (
+                <div className="course-switcher-empty">
+                  {activeTab === 'active' ? '还没有备考课程' : '还没有历史课程'}
                 </div>
-              )
-            })}
-          </div>
+              ) : (
+                <>
+                  <div className="course-switcher-wheel-area">
+                    <OptionWheel
+                      className="course-switcher-wheel"
+                      items={ordered.map((c) => c.name)}
+                      index={safeIndex}
+                      onChange={(i) => setFocusedId(ordered[i].id)}
+                      onActivate={() => focused && onSelectCourse(focused)}
+                      fontSize={1.25}
+                      centered
+                      ariaLabel="课程选择滚轮"
+                    />
+                  </div>
+
+                  {focused && (
+                    <div className="course-switcher-focus">
+                      <div className="course-switcher-focus-meta">
+                        <div className="course-switcher-focus-title-row">
+                          <strong>{focused.name}</strong>
+                        </div>
+                        <small>{focused.examDate} · 目标 {focused.targetScore} 分 · 每日 {focused.dailyHours}h</small>
+                      </div>
+                      <div className="course-switcher-focus-actions">
+                        <button
+                          className="primary-button course-switcher-confirm"
+                          type="button"
+                          onClick={() => onSelectCourse(focused)}
+                        >
+                          <Check size={14} /> 切换到此课程
+                        </button>
+                        <button
+                          className="course-switcher-delete"
+                          type="button"
+                          title={`删除 ${focused.name}`}
+                          aria-label={`删除 ${focused.name}`}
+                          onClick={() => onDeleteCourse(focused)}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
           <button className="course-switcher-add" type="button" onClick={onNewCourse}>
             <Plus size={15} /> 添加课程
           </button>
@@ -343,6 +439,9 @@ function App() {
   const [activeCourseId, setActiveCourseId] = useState('')
   const [courseWorkspaces, setCourseWorkspaces] = useState<Record<string, StudyWorkspace>>({})
   const [activeModule, setActiveModule] = useState<LearningModule>('overview')
+  const [activeStudyTaskId, setActiveStudyTaskId] = useState<string | null>(null)
+  const [streamingMessage, setStreamingMessage] = useState<StreamingMessage | null>(null)
+  const streamHandleRef = useRef<AgentStreamHandle | null>(null)
   const [theme, setTheme] = useState<'light' | 'dark'>('light')
   const [uiFont, setUiFont] = useState<UiFont>(readInitialUiFont)
   const [uiFontSize, setUiFontSize] = useState<UiFontSize>(readInitialUiFontSize)
@@ -354,6 +453,7 @@ function App() {
   const [aiPanelWidth, setAiPanelWidth] = useState<number | null>(null)
   const [isAiResizing, setIsAiResizing] = useState(false)
   const [isMaterialPreviewOpen, setIsMaterialPreviewOpen] = useState(false)
+  const [materialPreviewPath, setMaterialPreviewPath] = useState<string | null>(null)
   const [isNewCourseOpen, setIsNewCourseOpen] = useState(false)
   const [newCourseForm, setNewCourseForm] = useState<NewCourseForm>(initialNewCourseForm)
   const [newCourseError, setNewCourseError] = useState('')
@@ -369,6 +469,8 @@ function App() {
   const [strategyGenerationJob, setStrategyGenerationJob] = useState<StrategyGenerationJobState | null>(null)
   const courseMenuRef = useRef<HTMLDivElement | null>(null)
   const noteSaveTimer = useRef<number | undefined>(undefined)
+  // 最近一次尚停留在防抖定时器里、未真正发出的笔记；供 beforeunload 兜底 flush。
+  const pendingNoteRef = useRef<{ courseId: string; note: string } | null>(null)
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -414,7 +516,7 @@ function App() {
           if (isCancelled) return
           setCourseWorkspaces((current) => ({ ...current, [failedWorkspace.course.id]: failedWorkspace }))
           setCourses((current) => mergeCourseList([failedWorkspace.course], current))
-          setActiveModule('strategy')
+          setActiveModule('materials')
         }
       } catch (error) {
         if (isCancelled) return
@@ -449,7 +551,33 @@ function App() {
     }
   }, [uiFontSize])
 
+  useEffect(() => {
+    if (!activeCourseId) return
+    try {
+      window.localStorage.setItem(activeCourseStorageKey, activeCourseId)
+    } catch {
+      // 记不住上次课程时不影响当前会话。
+    }
+  }, [activeCourseId])
+
   useEffect(() => () => window.clearTimeout(noteSaveTimer.current), [])
+
+  // 页面关闭/刷新前，把还没等到防抖触发就发出的笔记立即 flush，避免静默丢失。
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const pending = pendingNoteRef.current
+      if (!pending) return
+      window.clearTimeout(noteSaveTimer.current)
+      noteSaveTimer.current = undefined
+      pendingNoteRef.current = null
+      flushCourseWorkspaceNote(pending.courseId, pending.note)
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [])
+
+  // 为所有 .primary-button 注入 SpecularButton 风格的边框流光跟随效果
+  useSpecularButtons()
 
   useEffect(() => {
     setSearchQuery('')
@@ -483,7 +611,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (activeModule !== 'strategy' || !activeCourseId) return
+    if (activeModule !== 'materials' || !activeCourseId) return
     let isActive = true
     const refreshStrategyDocuments = async () => {
       try {
@@ -541,7 +669,13 @@ function App() {
           listCourses().catch(() => []),
           listArchiveItems().catch(() => []),
         ])
-        const initialCourse = savedCourses[0]
+        let persistedCourseId: string | null = null
+        try {
+          persistedCourseId = window.localStorage.getItem(activeCourseStorageKey)
+        } catch {
+          persistedCourseId = null
+        }
+        const initialCourse = savedCourses.find((course) => course.id === persistedCourseId) ?? savedCourses[0]
         if (!initialCourse) throw new Error('尚未创建课程，请先在本机服务中创建课程。')
         const loadedWorkspace = await getCourseWorkspace(initialCourse.id)
         if (!isActive) return
@@ -549,7 +683,7 @@ function App() {
         const visibleCourses = mergeCourseList([loadedWorkspace.course], savedCourses)
         setCourses(visibleCourses)
         setArchiveItems(archivedItems)
-        setActiveCourseId(visibleCourses[0]?.id ?? '')
+        setActiveCourseId(initialCourse.id)
         setModelProfile(toRuntimeModelProfile(runtimeModel))
       } catch (error) {
         if (!isActive) return
@@ -570,6 +704,11 @@ function App() {
     if (activeCourse.id === workspace.course.id) return workspace
     return courseWorkspaces[activeCourse.id] ?? createLocalCourseWorkspace(activeCourse)
   }, [activeCourse, courseWorkspaces, workspace])
+  // 规划页需要全部课程的 workspace；把当前 live workspace 合进缓存，保证活动课程数据最新
+  const planningWorkspaces = useMemo(() => {
+    if (!workspace) return courseWorkspaces
+    return { ...courseWorkspaces, [workspace.course.id]: workspace }
+  }, [courseWorkspaces, workspace])
   const courseProgress = useMemo(() => {
     if (!activeWorkspace?.tasks.length) return activeWorkspace?.course.progress ?? 0
     return Math.round(
@@ -623,7 +762,18 @@ function App() {
 
   function updateWorkspaceTasks(tasks: PlanTask[]) {
     updateActiveWorkspace((current) => ({ ...current, tasks }))
-    if (activeWorkspace) void updateCourseWorkspace(activeWorkspace.course.id, { tasks }).catch(() => undefined)
+    if (activeWorkspace) {
+      // 乐观更新后用服务端返回对账：后端可能做 DAG 修复（任务顺延、schedulingWarnings）。
+      void updateCourseWorkspace(activeWorkspace.course.id, { tasks })
+        .then((reconciled) => {
+          if (reconciled?.tasks) {
+            updateActiveWorkspace((current) =>
+              current.tasks === reconciled.tasks ? current : { ...current, ...reconciled },
+            )
+          }
+        })
+        .catch(() => undefined)
+    }
   }
 
   const handleMaterialPreviewOpenChange = useCallback((isOpen: boolean) => {
@@ -697,6 +847,9 @@ function App() {
   }
 
   function openSearchResult(result: SearchResult) {
+    if (result.type === 'material' && result.source) {
+      setMaterialPreviewPath(result.source)
+    }
     changeActiveModule(result.module)
     setSearchOpen(false)
   }
@@ -783,10 +936,26 @@ function App() {
     updateActiveWorkspace((current) => ({ ...current, note }))
     if (!activeWorkspace) return
 
+    const courseId = activeWorkspace.course.id
+    pendingNoteRef.current = { courseId, note }
     window.clearTimeout(noteSaveTimer.current)
     noteSaveTimer.current = window.setTimeout(() => {
-      void updateCourseWorkspace(activeWorkspace.course.id, { note }).catch(() => undefined)
+      noteSaveTimer.current = undefined
+      pendingNoteRef.current = null
+      void updateCourseWorkspace(courseId, { note }).catch((error) => {
+        window.alert(error instanceof Error ? `笔记保存失败：${error.message}` : '笔记保存失败，请重试。')
+      })
     }, 550)
+  }
+
+  /** 把划词摘录追加到当前课程的复习笔记末尾（以 Markdown 引用块形式） */
+  function appendNoteSnippet(snippet: string) {
+    if (!activeWorkspace) return
+    const normalized = snippet.replace(/\r\n?/g, '\n').trim()
+    if (!normalized) return
+    const blockquote = `> ${normalized.replace(/\n/g, '\n> ')}`
+    const base = activeWorkspace.note.trimEnd()
+    updateNote(`${base}${base ? '\n\n' : ''}${blockquote}\n`)
   }
 
   async function applyProposal() {
@@ -810,6 +979,110 @@ function App() {
       setProposal(result)
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '忽略调整失败，请稍后再试。')
+    }
+  }
+
+  async function handleRecordTime(taskId: string | null, minutes: number, date?: string, note?: string) {
+    if (!activeWorkspace) throw new Error('当前课程尚未加载。')
+    try {
+      const result = await recordCourseTimeLog(activeWorkspace.course.id, {
+        taskId: taskId ?? undefined,
+        minutes,
+        date,
+        note,
+      })
+      updateActiveWorkspace((current) => ({
+        ...current,
+        timeLog: [...(current.timeLog ?? []), ...(result.entry ? [result.entry] : [])],
+        dailyProgress: result.dailyProgress,
+      }))
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '记录时长失败，请稍后再试。')
+      throw error
+    }
+  }
+
+  async function handleRecordMinutes(courseId: string, _courseName: string, minutes: number) {
+    try {
+      const result = await recordCourseTimeLog(courseId, { taskId: undefined, minutes })
+      if (activeWorkspace && activeWorkspace.course.id === courseId) {
+        updateActiveWorkspace((current) => ({
+          ...current,
+          timeLog: [...(current.timeLog ?? []), ...(result.entry ? [result.entry] : [])],
+          dailyProgress: result.dailyProgress,
+        }))
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '记录时长失败，请稍后再试。')
+    }
+  }
+
+  async function handleDeleteTime(entryId: string) {
+    if (!activeWorkspace) throw new Error('当前课程尚未加载。')
+    try {
+      const result = await deleteCourseTimeLog(activeWorkspace.course.id, entryId)
+      updateActiveWorkspace((current) => ({
+        ...current,
+        timeLog: (current.timeLog ?? []).filter((entry) => entry.id !== entryId),
+        dailyProgress: result.dailyProgress,
+      }))
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '删除时长记录失败，请稍后再试。')
+      throw error
+    }
+  }
+
+  async function handleApplyPlanProposal(proposalId: string) {
+    if (!activeWorkspace) throw new Error('当前课程尚未加载。')
+    try {
+      await applyCourseAdjustmentProposal(activeWorkspace.course.id, proposalId)
+      const refreshedWorkspace = await getCourseWorkspace(activeWorkspace.course.id)
+      updateActiveWorkspace(() => ({
+        ...refreshedWorkspace,
+        strategyDocuments: refreshedWorkspace.strategyDocuments ?? activeWorkspace.strategyDocuments,
+        // 兜底：即使刷新结果里仍带这条已采纳的提案，也立刻从列表里移除，确保卡片即时消失
+        pendingProposals: (refreshedWorkspace.pendingProposals ?? []).filter(
+          (item) => item.id !== proposalId,
+        ),
+      }))
+      // 采纳「重新编排」类提案时 dailyHours/days/examDate 会落地，需同步侧边栏课程列表
+      setCourses((current) => mergeCourseList([refreshedWorkspace.course], current))
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '应用调整失败，请稍后再试。')
+      throw error
+    }
+  }
+
+  async function handleAdjustPlanParams(payload: PlanParamsAdjustRequest) {
+    if (!activeWorkspace) throw new Error('当前课程尚未加载。')
+    try {
+      // 仅改考试日期 → 后端直接落地并刷新 review-plan.md（轻量分支，不产生卡片）；
+      // 改天数/每日时间 → 后端生成「重新编排」提案，刷新后出现在 pendingProposals 待采纳。
+      await adjustCoursePlan(activeWorkspace.course.id, payload)
+      const refreshedWorkspace = await getCourseWorkspace(activeWorkspace.course.id)
+      updateActiveWorkspace((current) => ({
+        ...refreshedWorkspace,
+        strategyDocuments: refreshedWorkspace.strategyDocuments ?? current.strategyDocuments,
+      }))
+      // 轻量分支会落地 examDate（侧边栏课程列表来自 SQLite listCourses，需同步刷新）
+      setCourses((current) => mergeCourseList([refreshedWorkspace.course], current))
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '调整复习参数失败，请稍后再试。')
+      throw error
+    }
+  }
+
+  async function handleDismissPlanProposal(proposalId: string) {
+    if (!activeWorkspace) return
+    try {
+      await dismissCourseAdjustmentProposal(activeWorkspace.course.id, proposalId)
+      updateActiveWorkspace((current) => ({
+        ...current,
+        pendingProposals: (current.pendingProposals ?? []).filter((item) => item.id !== proposalId),
+      }))
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '忽略调整失败，请稍后再试。')
+      throw error
     }
   }
 
@@ -845,7 +1118,7 @@ function App() {
     return result
   }
 
-  async function handleMockSubmit(answers: Record<string, number>) {
+  async function handleMockSubmit(answers: Record<string, MockAnswer>) {
     if (!activeWorkspace) {
       return {
         score: 0,
@@ -862,14 +1135,115 @@ function App() {
     return result
   }
 
-  async function handleAgentMessage(message: string) {
+  async function handleClearPracticeAnswer(questionId: string) {
     if (!activeWorkspace) return
-    const result = await askCourseAgent(activeWorkspace.course.id, message)
+    const refreshedWorkspace = await clearCoursePracticeAnswer(activeWorkspace.course.id, questionId)
     updateActiveWorkspace(() => ({
-      ...result.workspace,
-      strategyDocuments: result.workspace.strategyDocuments ?? activeWorkspace.strategyDocuments,
+      ...refreshedWorkspace,
+      strategyDocuments: refreshedWorkspace.strategyDocuments ?? activeWorkspace.strategyDocuments,
     }))
-    if (result.proposal) setProposal(result.proposal)
+  }
+
+  async function handleClearMockResult() {
+    if (!activeWorkspace) return
+    const refreshedWorkspace = await clearCourseMockResult(activeWorkspace.course.id)
+    updateActiveWorkspace(() => ({
+      ...refreshedWorkspace,
+      strategyDocuments: refreshedWorkspace.strategyDocuments ?? activeWorkspace.strategyDocuments,
+    }))
+  }
+
+  async function handleAgentMessage(message: string, mode: 'chat' | 'agent') {
+    if (!activeWorkspace) return
+    const workspaceSnapshot = activeWorkspace
+    const activeStudyTask = activeStudyTaskId
+      ? activeWorkspace.tasks.find((task) => task.id === activeStudyTaskId)
+      : undefined
+    const context = mode === 'agent' && activeStudyTask
+      ? {
+          activeModule,
+          currentTaskId: activeStudyTask.id,
+          currentTaskTitle: activeStudyTask.title,
+          currentTaskDay: activeStudyTask.day,
+          currentTaskOrder: activeStudyTask.order,
+          currentTaskSource: activeStudyTask.source,
+        }
+      : undefined
+
+    streamHandleRef.current?.cancel()
+    setStreamingMessage({ content: '', toolEvents: [] })
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        streamHandleRef.current = streamCourseAgent(
+          workspaceSnapshot.course.id,
+          message,
+          mode,
+          {
+            onToken: (text) =>
+              setStreamingMessage((current) =>
+                current ? { ...current, content: current.content + text } : current,
+              ),
+            onToolStart: (event) =>
+              setStreamingMessage((current) =>
+                current
+                  ? {
+                      ...current,
+                      toolEvents: [
+                        ...current.toolEvents,
+                        { step: event.step, name: event.name, label: event.label, status: 'running' },
+                      ],
+                    }
+                  : current,
+              ),
+            onToolEnd: (event) =>
+              setStreamingMessage((current) =>
+                current
+                  ? {
+                      ...current,
+                      toolEvents: current.toolEvents.map((toolEvent) =>
+                        toolEvent.step === event.step &&
+                        toolEvent.name === event.name &&
+                        toolEvent.status === 'running'
+                          ? { ...toolEvent, status: 'done', summary: event.summary }
+                          : toolEvent,
+                      ),
+                    }
+                  : current,
+              ),
+            onDone: (result) => {
+              setStreamingMessage(null)
+              updateActiveWorkspace(() => ({
+                ...result.workspace,
+                strategyDocuments: result.workspace.strategyDocuments ?? workspaceSnapshot.strategyDocuments,
+              }))
+              if (result.proposal) setProposal(result.proposal)
+              resolve()
+            },
+            onError: (errorMessage) => {
+              // 流式不可用（上游不支持 stream / 网络中断）→ 自动降级到非流式，保证用户拿到回复
+              askCourseAgent(workspaceSnapshot.course.id, message, mode, context)
+                .then((fallback) => {
+                  updateActiveWorkspace(() => ({
+                    ...fallback.workspace,
+                    strategyDocuments: fallback.workspace.strategyDocuments ?? workspaceSnapshot.strategyDocuments,
+                  }))
+                  if (fallback.proposal) setProposal(fallback.proposal)
+                  resolve()
+                })
+                .catch((error) => {
+                  reject(error instanceof Error ? error : new Error(errorMessage))
+                })
+                .finally(() => setStreamingMessage(null))
+            },
+          },
+          context,
+        )
+      })
+    } catch (error) {
+      setStreamingMessage(null)
+      throw error
+    }
   }
 
   async function handleRescanMaterials() {
@@ -906,6 +1280,7 @@ function App() {
     targetText: string
     dailyHours: number
     days: number
+    reviewCount: number
     examFormat: string
     remarks: string
   }) {
@@ -954,6 +1329,29 @@ function App() {
       },
     })
     setActiveModule('plan')
+  }
+
+  async function handleRefreshWorkspace() {
+    if (!activeWorkspace) throw new Error('当前课程尚未加载。')
+    const refreshedWorkspace = await getCourseWorkspace(activeWorkspace.course.id)
+    if (workspace && refreshedWorkspace.course.id === workspace.course.id) {
+      setWorkspace(refreshedWorkspace)
+    } else {
+      setCourseWorkspaces((current) => ({ ...current, [refreshedWorkspace.course.id]: refreshedWorkspace }))
+    }
+    setCourses((current) => mergeCourseList([refreshedWorkspace.course], current))
+    setActiveCourseId(refreshedWorkspace.course.id)
+  }
+
+  async function handleRepairStrategyGeneration() {
+    if (!activeWorkspace?.strategyDocuments) throw new Error('当前课程没有可用于修复的策略文档。')
+    const { reviewPlan, coursePrompt } = activeWorkspace.strategyDocuments
+    await handleApproveStrategyDocuments({
+      reviewPlan: reviewPlan.content,
+      coursePrompt: coursePrompt.content,
+      reviewPlanVersion: reviewPlan.version,
+      coursePromptVersion: coursePrompt.version,
+    })
   }
 
   async function handleGenerateStrategyDocuments() {
@@ -1061,6 +1459,7 @@ function App() {
   }
 
   return (
+    <CourseTimerProvider onRecordMinutes={handleRecordMinutes}>
     <div
       className={`app-shell${isAiCollapsed ? ' is-ai-collapsed' : ''}${isAiOpen ? ' is-ai-open' : ''}${isMaterialPreviewOpen ? ' is-material-preview-open' : ''}${isAiResizing ? ' is-ai-resizing' : ''}`}
       style={appShellStyle}
@@ -1091,6 +1490,11 @@ function App() {
             </div>
           </div>
 
+          <TopbarCourseTimer
+            activeCourseId={activeWorkspace.course.id}
+            activeCourseName={activeWorkspace.course.name}
+          />
+
           <div className="topbar-actions">
             <CourseSwitcher
               courses={courses}
@@ -1118,9 +1522,6 @@ function App() {
             >
               {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
             </button>
-            <button className="icon-button desktop-only" type="button" aria-label="提醒">
-              <Bell size={18} />
-            </button>
             <QuickBackToTopButton />
             <button
               className="icon-button mobile-only"
@@ -1135,6 +1536,8 @@ function App() {
 
         <ModuleView
           activeModule={activeModule}
+          courses={courses}
+          courseWorkspaces={planningWorkspaces}
           course={activeWorkspace.course}
           courseProgress={courseProgress}
           completedTasks={completedTasks}
@@ -1142,6 +1545,8 @@ function App() {
           knowledgePoints={activeWorkspace.knowledgePoints}
           practiceQuestions={activeWorkspace.practiceQuestions}
           mockQuestions={activeWorkspace.mockQuestions}
+          practiceAnswers={activeWorkspace.practiceAnswers}
+          mockResult={activeWorkspace.mockResult}
           materials={activeWorkspace.materials}
           materialMemory={activeWorkspace.materialMemory}
           assessmentProfile={activeWorkspace.assessmentProfile}
@@ -1175,11 +1580,27 @@ function App() {
           onSubmitDiagnostic={handleSubmitDiagnostic}
           onGenerateStrategyDocuments={handleGenerateStrategyDocuments}
           onApproveStrategyDocuments={handleApproveStrategyDocuments}
+          onRefreshWorkspace={handleRefreshWorkspace}
+          onRepairStrategyGeneration={handleRepairStrategyGeneration}
           onSaveCoursePrompt={handleSaveCoursePrompt}
           onMaterialPreviewOpenChange={handleMaterialPreviewOpenChange}
+          materialPreviewPath={materialPreviewPath}
+          onMaterialPreviewRequestHandled={() => setMaterialPreviewPath(null)}
           onSubmitPractice={handlePracticeAnswer}
           onSubmitWrongAnswer={handleWrongAnswerRetry}
           onSubmitMock={handleMockSubmit}
+          onClearPracticeAnswer={handleClearPracticeAnswer}
+          onClearMockResult={handleClearMockResult}
+          onActiveStudyTaskChange={setActiveStudyTaskId}
+          planStartDate={activeWorkspace.planStartDate}
+          timeLog={activeWorkspace.timeLog}
+          dailyProgress={activeWorkspace.dailyProgress}
+          pendingProposals={activeWorkspace.pendingProposals}
+          onRecordTime={handleRecordTime}
+          onDeleteTime={handleDeleteTime}
+          onApplyProposal={handleApplyPlanProposal}
+          onDismissProposal={handleDismissPlanProposal}
+          onAdjustPlanParams={handleAdjustPlanParams}
         />
       </main>
 
@@ -1196,6 +1617,7 @@ function App() {
         onApplyProposal={applyProposal}
         onDismissProposal={dismissProposal}
         onSendMessage={handleAgentMessage}
+        streamingMessage={streamingMessage}
       />
 
       {isNewCourseOpen && (
@@ -1342,7 +1764,9 @@ function App() {
         </div>
       )}
 
+      <SelectionToNoteToolbar onAddToNote={appendNoteSnippet} />
     </div>
+    </CourseTimerProvider>
   )
 }
 

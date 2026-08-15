@@ -1,0 +1,91 @@
+/* OptionWheel —— 弧形滚轮单选器（移植自 reactbits，主题化 + 字重适配中文）。
+ * 颜色走主题变量：居中项 var(--primary)，其余 var(--text-soft)，随 data-theme 切换。
+ * 视觉位置/变换由 OptionWheel.tsx 的 rAF 引擎逐帧写入 inline style，这里只管静态外观。
+ */
+.option-wheel {
+  --ow-text-color: var(--text-soft);
+  --ow-active-color: var(--primary);
+  --ow-font-size: 1.5rem;
+  --ow-inset: 24px;
+
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  outline: none;
+}
+
+.option-wheel:focus-visible {
+  /* 居中项已有 --primary 高亮，这里只给容器一圈很淡的聚焦辉光，避免抢戏。 */
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 35%, transparent);
+}
+
+.option-wheel--dragging {
+  cursor: grabbing;
+}
+
+.option-wheel__item {
+  position: absolute;
+  top: 50%;
+  left: var(--ow-inset);
+  white-space: nowrap;
+  font-size: var(--ow-font-size);
+  line-height: 1;
+  font-weight: 600;
+  transform-origin: left center;
+  cursor: pointer;
+  will-change: transform, opacity, filter;
+  letter-spacing: 0.01em;
+  /* --ow-p 由 rAF 引擎写入：0=远离居中，1=居中。居中越近越偏 active 色。 */
+  color: color-mix(
+    in srgb,
+    var(--ow-active-color) calc(var(--ow-p, 0) * 100%),
+    var(--ow-text-color)
+  );
+}
+
+.option-wheel--right .option-wheel__item {
+  left: auto;
+  right: var(--ow-inset);
+  transform-origin: right center;
+}
+
+.option-wheel__item--selected {
+  font-weight: 850;
+}
+
+/* 分组小标签（如「备考」「已结束」）：随主文案淡入淡出，仅居中项最清晰。 */
+.option-wheel__item-label {
+  /* 让 label 与 tag 在同一行内自然排列； nowrap 由 .option-wheel__item 保证。 */
+}
+
+.option-wheel__item-tag {
+  display: inline-block;
+  margin-left: 9px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 0.62em;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
+.option-wheel__item-tag[data-tone='history'] {
+  background: color-mix(in srgb, var(--text-soft) 12%, transparent);
+  color: var(--text-muted);
+  border-color: color-mix(in srgb, var(--line-strong) 70%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .option-wheel {
+    cursor: default;
+  }
+}

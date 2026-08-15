@@ -1,7 +1,7 @@
 export type LearningModule =
   | 'overview'
   | 'materials'
-  | 'strategy'
+  | 'planning'
   | 'mindmap'
   | 'plan'
   | 'practice'
@@ -206,6 +206,7 @@ export type PlanTask = {
   priority: 'high' | 'medium' | 'low'
   studyGuide?: StudyGuide
   contentQualityWarning?: string
+  schedulingReason?: string
 }
 
 export type WrongAnswer = {
@@ -267,7 +268,18 @@ export type AdjustmentProposal = {
   operations?: Array<Record<string, unknown>>
   before?: Record<string, unknown>
   after?: Record<string, unknown>
+  params?: { examDate?: string; days?: number; dailyHours?: number }
 }
+
+export type PlanParamsAdjustRequest = {
+  examDate?: string
+  days?: number
+  dailyHours?: number
+}
+
+export type PlanParamsAdjustResponse =
+  | { workspace: StudyWorkspace; proposal: null }
+  | { workspace: null; proposal: AdjustmentProposal }
 
 export type Material = {
   name: string
@@ -328,6 +340,7 @@ export type CourseOnboarding = {
   targetText: string
   dailyHours: number
   days: number
+  reviewCount?: number
   examFormat: string
   remarks: string
   diagnosticScore?: number
@@ -369,8 +382,11 @@ export type KnowledgePoint = {
   name: string
   mastery: number
   weight: number
+  difficulty?: number
+  prerequisites?: string[]
   summary: string
   source: string
+  moduleId?: string
 }
 
 export type QuizQuestion = {
@@ -481,6 +497,7 @@ export type StudyWorkspace = {
   timeLog?: TimeLogEntry[]
   dailyProgress?: DailyProgress
   pendingProposals?: AdjustmentProposal[]
+  schedulingWarnings?: string[]
 }
 
 export type PracticeAnswerResult = {

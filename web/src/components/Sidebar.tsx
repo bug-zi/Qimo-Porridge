@@ -1,5 +1,8 @@
+import { useEffect, useMemo, useState } from 'react'
+import { OptionWheel } from './OptionWheel'
 import {
   Braces,
+  CalendarDays,
   CircleCheck,
   ClipboardList,
   Database,
@@ -7,6 +10,7 @@ import {
   FileArchive,
   FileText,
   Grid2X2,
+  Network,
   Orbit,
   Plus,
   Sigma,
@@ -17,6 +21,12 @@ import {
   X,
 } from 'lucide-react'
 import type { Course, LearningModule } from '../types'
+import {
+  buildCourseTimeline,
+  summarizeTimeline,
+  COURSE_CATEGORY_TABS,
+  type CourseTimelineCategory,
+} from '../utils/courseTimeline'
 
 type MainNavigationProps = {
   activeModule: LearningModule
@@ -36,7 +46,8 @@ type CoursePanelProps = {
 const moduleItems: { id: LearningModule; label: string; icon: typeof CircleCheck }[] = [
   { id: 'overview', label: '总览', icon: Grid2X2 },
   { id: 'materials', label: '资料库', icon: FileArchive },
-  { id: 'strategy', label: '复习策略', icon: FileText },
+  { id: 'planning', label: '规划', icon: CalendarDays },
+  { id: 'mindmap', label: '知识地图', icon: Network },
   { id: 'plan', label: '复习主线', icon: CircleCheck },
   { id: 'practice', label: '刷题', icon: Target },
   { id: 'mock', label: '模拟卷', icon: ClipboardList },
@@ -72,7 +83,6 @@ export function MainNavigation({ activeModule, onModuleChange }: MainNavigationP
       </button>
 
       <div className="nav-section">
-        <span className="nav-section-label">学习</span>
         {moduleItems.map((item) => {
           const Icon = item.icon
           return (
@@ -114,6 +124,44 @@ export function CoursePanel({
   isOpen,
   onClose,
 }: CoursePanelProps) {
+  const [focusedCourseId, setFocusedCourseId] = useState(activeCourseId)
+  // 当前查看的课程分类：默认「备考」，每次打开面板回到「备考」。
+  const [activeTab, setActiveTab] = useState<CourseTimelineCategory>('active')
+
+  // 外部（顶栏）切换 active 课程时，滚轮焦点跟随。
+  useEffect(() => {
+    setFocusedCourseId(activeCourseId)
+  }, [activeCourseId])
+
+  // 每次打开面板默认显示「备考」课程。
+  useEffect(() => {
+    if (isOpen) setActiveTab('active')
+  }, [isOpen])
+
+  // 按考试时间分成「备考 / 历史」两类并排序：备考在前（升序），历史在后（降序）。
+  const timeline = useMemo(() => buildCourseTimeline(courses), [courses])
+  const categoryCounts = useMemo(() => summarizeTimeline(timeline), [timeline])
+  // 仅展示当前选中分类的课程。
+  const ordered = useMemo(
+    () => timeline.filter((entry) => entry.category === activeTab).map((entry) => entry.course),
+    [timeline, activeTab],
+  )
+
+  // 切换分类或删除当前预览课程后，焦点落回 active 课程或该分类首门，避免滚轮指向不存在的项。
+  useEffect(() => {
+    if (ordered.length === 0) return
+    if (ordered.some((c) => c.id === focusedCourseId)) return
+    setFocusedCourseId(
+      ordered.some((c) => c.id === activeCourseId) ? activeCourseId : ordered[0].id,
+    )
+  }, [ordered, focusedCourseId, activeCourseId])
+
+  const safeIndex = Math.max(
+    0,
+    ordered.findIndex((c) => c.id === focusedCourseId),
+  )
+  const focused = ordered[safeIndex]
+
   return (
     <aside className={`course-panel ${isOpen ? 'is-open' : ''}`}>
       <header className="course-panel-header">
@@ -129,40 +177,101 @@ export function CoursePanel({
         </button>
       </header>
 
-      <div className="course-list">
-        {courses.map((course) => (
-          <article
-            className={`course-card ${course.id === activeCourseId ? 'is-selected' : ''}`}
-            key={course.id}
-          >
-            <button className="course-card-select" type="button" onClick={() => onSelectCourse(course)}>
-              <span className="course-card-icon">
-                <CourseGlyph course={course} />
+      {timeline.length === 0 ? (
+        <div className="course-empty">
+          <span className="course-empty-text">还没有课程，新建一门开始吧</span>
+          <button className="primary-button" type="button" onClick={onNewCourse}>
+            <Plus size={16} /> 新建课程
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="course-category-tabs" role="tablist" aria-label="课程分类">
+            {COURSE_CATEGORY_TABS.map((tab) => {
+              const count = categoryCounts[tab.key]
+              const isActive = activeTab === tab.key
+              return (
+                <button
+                  key={tab.key}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  data-status={tab.key}
+                  className={`course-category-tab${isActive ? ' is-active' : ''}`}
+                  onClick={() => setActiveTab(tab.key)}
+                  disabled={count === 0 && !isActive}
+                >
+                  <span>{tab.label}</span>
+                  <small>{count}</small>
+                </button>
+              )
+            })}
+          </div>
+
+          {ordered.length === 0 ? (
+            <div className="course-empty">
+              <span className="course-empty-text">
+                {activeTab === 'active' ? '还没有备考课程' : '还没有历史课程'}
               </span>
-              <span className="course-card-content">
-                <span className="course-card-title">{course.name}</span>
-                <span className="course-card-meta">{course.examDate} <i></i> 目标 {course.targetScore} 分</span>
-                <span className="course-progress">
-                  <span style={{ width: `${course.progress}%` }}></span>
-                </span>
-                <span className="course-card-footer">
-                  <span>每日可用 {course.dailyHours} 小时</span>
-                  <b>{course.progress}%</b>
-                </span>
-              </span>
-            </button>
-            <button
-              className="course-delete-button"
-              type="button"
-              title={`删除 ${course.name}`}
-              aria-label={`删除 ${course.name}`}
-              onClick={() => onDeleteCourse(course)}
-            >
-              <Trash2 size={15} />
-            </button>
-          </article>
-        ))}
-      </div>
+            </div>
+          ) : (
+            <>
+              <div className="course-wheel-area">
+                <OptionWheel
+                  items={ordered.map((c) => c.name)}
+                  index={safeIndex}
+                  onChange={(i) => setFocusedCourseId(ordered[i].id)}
+                  onActivate={() => focused && onSelectCourse(focused)}
+                  ariaLabel="课程选择滚轮"
+                />
+              </div>
+
+              {focused && (
+                <article className="course-focus-card">
+                  <div className="course-focus-head">
+                    <span className="course-card-icon">
+                      <CourseGlyph course={focused} />
+                    </span>
+                    <span className="course-card-content">
+                      <span className="course-card-title-row">
+                        <span className="course-card-title">{focused.name}</span>
+                      </span>
+                      <span className="course-card-meta">
+                        {focused.examDate} <i></i> 目标 {focused.targetScore} 分
+                      </span>
+                      <span className="course-progress">
+                        <span style={{ width: `${focused.progress}%` }}></span>
+                      </span>
+                      <span className="course-card-footer">
+                        <span>每日可用 {focused.dailyHours} 小时</span>
+                        <b>{focused.progress}%</b>
+                      </span>
+                    </span>
+                  </div>
+                  <div className="course-focus-actions">
+                    <button
+                      className="primary-button"
+                      type="button"
+                      onClick={() => onSelectCourse(focused)}
+                    >
+                      进入课程
+                    </button>
+                    <button
+                      className="course-focus-delete"
+                      type="button"
+                      title={`删除 ${focused.name}`}
+                      aria-label={`删除 ${focused.name}`}
+                      onClick={() => onDeleteCourse(focused)}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </article>
+              )}
+            </>
+          )}
+        </>
+      )}
     </aside>
   )
 }

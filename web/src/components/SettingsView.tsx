@@ -15,16 +15,19 @@ import {
   Save,
   Sparkles,
   Sun,
+  UserRound,
 } from 'lucide-react'
 import {
   discoverMcpServer,
   getEmbeddingProfile,
   getKnowledgeBaseStatus,
+  getUserProfilePrompt,
   listMcpServers,
   rebuildKnowledgeEmbeddings,
   saveEmbeddingProfile,
   saveMcpServer,
   saveRuntimeModel,
+  saveUserProfilePrompt,
   testEmbeddingProfile,
   toRuntimeModelProfile,
 } from '../api'
@@ -154,6 +157,7 @@ const uiFontOptions: Array<{ id: UiFont; label: string; previewFamily: string }>
 ]
 
 const uiFontSizeOptions: UiFontSize[] = [90, 95, 100, 105, 110, 115]
+const userProfilePromptMaxLength = 4000
 
 const defaultEmbeddingProfile: EmbeddingProfile = {
   enabled: true,
@@ -252,6 +256,10 @@ export function SettingsView({
   })
   const [mcpAction, setMcpAction] = useState<'idle' | 'saving' | 'discovering'>('idle')
   const [mcpMessage, setMcpMessage] = useState('')
+  const [userProfilePrompt, setUserProfilePrompt] = useState('')
+  const [userProfileUpdatedAt, setUserProfileUpdatedAt] = useState('')
+  const [userProfileAction, setUserProfileAction] = useState<'idle' | 'loading' | 'saving'>('loading')
+  const [userProfileMessage, setUserProfileMessage] = useState('')
   const draftRef = useRef(draft)
 
   useEffect(() => {
@@ -291,6 +299,27 @@ export function SettingsView({
       })
       .catch((error) => {
         if (!isCancelled) setMcpMessage(error instanceof Error ? error.message : '无法读取 MCP 服务。')
+      })
+    return () => {
+      isCancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    let isCancelled = false
+    setUserProfileAction('loading')
+    void getUserProfilePrompt()
+      .then((profile) => {
+        if (isCancelled) return
+        setUserProfilePrompt(profile.content)
+        setUserProfileUpdatedAt(profile.updatedAt)
+        setUserProfileMessage('')
+      })
+      .catch((error) => {
+        if (!isCancelled) setUserProfileMessage(error instanceof Error ? error.message : '无法读取用户自画像。')
+      })
+      .finally(() => {
+        if (!isCancelled) setUserProfileAction('idle')
       })
     return () => {
       isCancelled = true
@@ -585,6 +614,25 @@ export function SettingsView({
       setMcpMessage(error instanceof Error ? error.message : 'MCP 工具发现失败。')
     } finally {
       setMcpAction('idle')
+    }
+  }
+
+  async function saveUserProfileSettings() {
+    if (userProfilePrompt.length > userProfilePromptMaxLength) {
+      setUserProfileMessage(`用户自画像不能超过 ${userProfilePromptMaxLength} 字。`)
+      return
+    }
+    setUserProfileAction('saving')
+    setUserProfileMessage('')
+    try {
+      const profile = await saveUserProfilePrompt(userProfilePrompt)
+      setUserProfilePrompt(profile.content)
+      setUserProfileUpdatedAt(profile.updatedAt)
+      setUserProfileMessage('用户自画像已保存，并会对所有课程生效。')
+    } catch (error) {
+      setUserProfileMessage(error instanceof Error ? error.message : '用户自画像保存失败。')
+    } finally {
+      setUserProfileAction('idle')
     }
   }
 
@@ -976,6 +1024,43 @@ export function SettingsView({
             <p className="font-preview" style={{ fontFamily: selectedUiFont.previewFamily }}>
               期末粥加速器 · 公式 / 笔记 / 错题
             </p>
+          </section>
+
+          <section className="settings-panel user-profile-panel">
+            <header className="settings-panel-heading">
+              <div className="settings-heading-icon secondary"><UserRound size={19} /></div>
+              <div>
+                <h2>用户自画像</h2>
+                <p>补充你的长期学习偏好，对所有课程生效。</p>
+              </div>
+            </header>
+            <label className="settings-field">
+              <span>全局 Prompt</span>
+              <textarea
+                className="user-profile-textarea"
+                value={userProfilePrompt}
+                maxLength={userProfilePromptMaxLength}
+                disabled={userProfileAction !== 'idle'}
+                placeholder="例如：我基础较弱，讲解时先解释公式含义，再给步骤；做题时不要直接跳到答案。"
+                onChange={(event) => setUserProfilePrompt(event.target.value)}
+              />
+            </label>
+            <div className="user-profile-meta">
+              <span>{userProfilePrompt.length}/{userProfilePromptMaxLength}</span>
+              <span>{userProfileUpdatedAt ? `最近保存：${userProfileUpdatedAt}` : '尚未保存'}</span>
+            </div>
+            {userProfileMessage && <p className="embedding-inline-note">{userProfileMessage}</p>}
+            <div className="settings-actions">
+              <button
+                className="primary-button"
+                type="button"
+                disabled={userProfileAction !== 'idle' || userProfilePrompt.length > userProfilePromptMaxLength}
+                onClick={saveUserProfileSettings}
+              >
+                {userProfileAction === 'saving' ? <LoaderCircle className="is-spinning" size={16} /> : <Save size={16} />}
+                保存自画像
+              </button>
+            </div>
           </section>
         </aside>
       </div>

@@ -3,18 +3,25 @@ import type {
   AgentJob,
   ArchiveItem,
   Course,
+  CourseMindMap,
+  DailyProgress,
   EmbeddingProfile,
   ExternalSource,
   KnowledgeBaseStatus,
   MaterialPreview,
   McpServer,
+  MockAnswer,
   MockSubmitResult,
   ModelProfile,
+  PlanParamsAdjustRequest,
+  PlanParamsAdjustResponse,
   PlanTask,
   PracticeAnswerResult,
   SearchResult,
   StrategyDocuments,
   StudyWorkspace,
+  TimeLogEntry,
+  UserProfilePrompt,
   WrongAnswer,
 } from './types'
 
@@ -69,6 +76,12 @@ type RestoreArchiveApiResponse = {
   course?: CourseApiResponse
   workspace?: StudyWorkspace
   archive_items: ArchiveItemApiResponse[]
+}
+
+type CourseMindMapApiResponse = {
+  status: 'ready' | 'empty'
+  courseId: string
+  mindMap: CourseMindMap | null
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -158,6 +171,29 @@ export function getCourseWorkspace(courseId: string) {
   return request<StudyWorkspace>(`/courses/${encodeURIComponent(courseId)}/workspace`)
 }
 
+export function getCourseMindMap(courseId: string) {
+  return request<CourseMindMapApiResponse>(`/courses/${encodeURIComponent(courseId)}/mind-map`)
+}
+
+export function generateCourseMindMap(courseId: string) {
+  return request<CourseMindMapApiResponse>(`/courses/${encodeURIComponent(courseId)}/mind-map/generate`, {
+    method: 'POST',
+  })
+}
+
+export function regroupCourseMindMapModules(courseId: string) {
+  return request<CourseMindMapApiResponse>(`/courses/${encodeURIComponent(courseId)}/mind-map/regroup-modules`, {
+    method: 'POST',
+  })
+}
+
+export function saveCourseMindMap(courseId: string, mindMap: CourseMindMap) {
+  return request<CourseMindMapApiResponse>(`/courses/${encodeURIComponent(courseId)}/mind-map`, {
+    method: 'PUT',
+    body: JSON.stringify(mindMap),
+  })
+}
+
 export async function searchCourse(courseId: string, query: string) {
   const response = await request<{ query: string; results: SearchResult[] }>(
     `/courses/${encodeURIComponent(courseId)}/search?q=${encodeURIComponent(query)}`,
@@ -172,6 +208,7 @@ export function saveCourseSetup(courseId: string, payload: {
   targetText: string
   dailyHours: number
   days: number
+  reviewCount: number
   examFormat: string
   remarks: string
 }) {
@@ -184,6 +221,7 @@ export function saveCourseSetup(courseId: string, payload: {
       target_text: payload.targetText,
       daily_hours: payload.dailyHours,
       days: payload.days,
+      review_count: payload.reviewCount,
       exam_format: payload.examFormat,
       remarks: payload.remarks,
     }),
@@ -319,6 +357,17 @@ export function saveRuntimeModel(payload: { baseUrl: string; apiKey: string; mod
   })
 }
 
+export function getUserProfilePrompt() {
+  return request<UserProfilePrompt>('/user-profile')
+}
+
+export function saveUserProfilePrompt(content: string) {
+  return request<UserProfilePrompt>('/user-profile', {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  })
+}
+
 export function getEmbeddingProfile() {
   return request<EmbeddingProfile>('/knowledge/embedding')
 }
@@ -369,11 +418,22 @@ export function submitCourseWrongAnswerRetry(courseId: string, wrongAnswerId: st
   )
 }
 
-export function submitCourseMockAnswers(courseId: string, answers: Record<string, number>) {
+export function submitCourseMockAnswers(courseId: string, answers: Record<string, MockAnswer>) {
   return request<MockSubmitResult>(`/courses/${encodeURIComponent(courseId)}/mock/submit`, {
     method: 'POST',
     body: JSON.stringify({ answers }),
   })
+}
+
+export function clearCoursePracticeAnswer(courseId: string, questionId: string) {
+  return request<StudyWorkspace>(
+    `/courses/${encodeURIComponent(courseId)}/practice/answers/${encodeURIComponent(questionId)}`,
+    { method: 'DELETE' },
+  )
+}
+
+export function clearCourseMockResult(courseId: string) {
+  return request<StudyWorkspace>(`/courses/${encodeURIComponent(courseId)}/mock/result`, { method: 'DELETE' })
 }
 
 export function updateCourseWorkspace(courseId: string, payload: {
@@ -391,7 +451,53 @@ export function updateCourseWorkspace(courseId: string, payload: {
   })
 }
 
-export function askCourseAgent(courseId: string, message: string) {
+/**
+ * 页面卸载时的“尽力保存”：keepalive 让浏览器在页面关闭后仍会发出请求，
+ * 专门用于捕获尚停留在防抖定时器里、来不及通过 updateCourseWorkspace 发出的笔记。
+ * 失败静默——这是最后兜底手段；正常链路由 updateCourseWorkspace + 失败提示负责。
+ */
+export function flushCourseWorkspaceNote(courseId: string, note: string): void {
+  void fetch(`${apiBaseUrl}/courses/${encodeURIComponent(courseId)}/workspace`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ note }),
+    keepalive: true,
+  }).catch(() => undefined)
+}
+
+type TimeLogResponse = {
+  entry?: TimeLogEntry
+  dailyProgress: DailyProgress
+}
+
+export function recordCourseTimeLog(
+  courseId: string,
+  payload: { taskId?: string; minutes: number; date?: string; note?: string },
+) {
+  return request<TimeLogResponse>(`/courses/${encodeURIComponent(courseId)}/time-log`, {
+    method: 'POST',
+    body: JSON.stringify({
+      task_id: payload.taskId ?? '',
+      minutes: payload.minutes,
+      target_date: payload.date ?? '',
+      note: payload.note ?? '',
+    }),
+  })
+}
+
+export function deleteCourseTimeLog(courseId: string, entryId: string) {
+  return request<TimeLogResponse>(
+    `/courses/${encodeURIComponent(courseId)}/time-log/${encodeURIComponent(entryId)}`,
+    { method: 'DELETE' },
+  )
+}
+
+export function askCourseAgent(
+  courseId: string,
+  message: string,
+  mode: 'chat' | 'agent',
+  context?: Record<string, unknown>,
+) {
   return request<{
     reply: string
     workspace: StudyWorkspace
@@ -400,8 +506,141 @@ export function askCourseAgent(courseId: string, message: string) {
     sources?: Array<Record<string, unknown>>
   }>(
     `/courses/${encodeURIComponent(courseId)}/agent/chat`,
-    { method: 'POST', body: JSON.stringify({ message }) },
+    { method: 'POST', body: JSON.stringify({ message, mode, context }) },
   )
+}
+
+export type AgentStreamDone = {
+  reply: string
+  workspace: StudyWorkspace
+  proposal?: AdjustmentProposal | null
+  sources?: Array<Record<string, unknown>>
+  runId?: string
+}
+
+export type AgentStreamHandlers = {
+  onToken: (text: string) => void
+  onStep?: (step: number) => void
+  onToolStart?: (event: { step: number; name: string; label: string }) => void
+  onToolEnd?: (event: { step: number; name: string; summary: string }) => void
+  onWarning?: (message: string) => void
+  onDone: (result: AgentStreamDone) => void
+  onError: (message: string) => void
+}
+
+export type AgentStreamHandle = { cancel: () => void }
+
+function parseAgentSseEvent(rawEvent: string, handlers: AgentStreamHandlers) {
+  let eventType = 'message'
+  const dataLines: string[] = []
+  for (const line of rawEvent.split('\n')) {
+    if (line.startsWith('event:')) {
+      eventType = line.slice(6).trim()
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trim())
+    }
+  }
+  if (!dataLines.length) return
+  let payload: Record<string, unknown>
+  try {
+    payload = JSON.parse(dataLines.join('\n'))
+  } catch {
+    return
+  }
+  switch (eventType) {
+    case 'token':
+      if (typeof payload.text === 'string') handlers.onToken(payload.text)
+      break
+    case 'step':
+      if (typeof payload.step === 'number' && handlers.onStep) handlers.onStep(payload.step)
+      break
+    case 'tool_start':
+      if (handlers.onToolStart) {
+        handlers.onToolStart(payload as { step: number; name: string; label: string })
+      }
+      break
+    case 'tool_end':
+      if (handlers.onToolEnd) {
+        handlers.onToolEnd(payload as { step: number; name: string; summary: string })
+      }
+      break
+    case 'warning':
+      if (handlers.onWarning && typeof payload.message === 'string') handlers.onWarning(payload.message)
+      break
+    case 'done':
+      handlers.onDone(payload as AgentStreamDone)
+      break
+    case 'error':
+      handlers.onError(typeof payload.message === 'string' ? payload.message : 'AI 伴学响应出错。')
+      break
+    default:
+      break
+  }
+}
+
+export function streamCourseAgent(
+  courseId: string,
+  message: string,
+  mode: 'chat' | 'agent',
+  handlers: AgentStreamHandlers,
+  context?: Record<string, unknown>,
+): AgentStreamHandle {
+  const controller = new AbortController()
+  let cancelled = false
+
+  void (async () => {
+    let response: Response
+    try {
+      response = await fetch(
+        `${apiBaseUrl}/courses/${encodeURIComponent(courseId)}/agent/chat/stream`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, mode, context }),
+          signal: controller.signal,
+        },
+      )
+    } catch (error) {
+      if (!cancelled) {
+        handlers.onError(error instanceof Error ? error.message : '无法连接流式接口。')
+      }
+      return
+    }
+    if (!response.ok || !response.body) {
+      if (!cancelled) handlers.onError(`流式接口返回异常（HTTP ${response.status}）。`)
+      return
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let separatorIndex = buffer.indexOf('\n\n')
+        while (separatorIndex >= 0) {
+          const rawEvent = buffer.slice(0, separatorIndex)
+          buffer = buffer.slice(separatorIndex + 2)
+          parseAgentSseEvent(rawEvent, handlers)
+          separatorIndex = buffer.indexOf('\n\n')
+        }
+      }
+      if (buffer.trim()) parseAgentSseEvent(buffer, handlers)
+    } catch (error) {
+      if (!cancelled) {
+        handlers.onError(error instanceof Error ? error.message : '读取流式响应失败。')
+      }
+    }
+  })()
+
+  return {
+    cancel: () => {
+      cancelled = true
+      controller.abort()
+    },
+  }
 }
 
 export function applyCourseAdjustmentProposal(courseId: string, proposalId: string) {
@@ -415,6 +654,20 @@ export function dismissCourseAdjustmentProposal(courseId: string, proposalId: st
   return request<AdjustmentProposal>(
     `/courses/${encodeURIComponent(courseId)}/adjustment-proposals/${encodeURIComponent(proposalId)}/dismiss`,
     { method: 'POST' },
+  )
+}
+
+export function adjustCoursePlan(courseId: string, payload: PlanParamsAdjustRequest) {
+  return request<PlanParamsAdjustResponse>(
+    `/courses/${encodeURIComponent(courseId)}/plan/adjust`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        exam_date: payload.examDate,
+        days: payload.days,
+        daily_hours: payload.dailyHours,
+      }),
+    },
   )
 }
 

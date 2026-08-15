@@ -1,4 +1,4 @@
-import { type FormEvent, type PointerEvent as ReactPointerEvent, useState } from 'react'
+import { type FormEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
 import { Bot, Check, LoaderCircle, MessageCircle, PanelRightClose, PanelRightOpen, Send, Sparkles, X } from 'lucide-react'
 import rehypeKatex from 'rehype-katex'
 import ReactMarkdown from 'react-markdown'
@@ -125,6 +125,11 @@ export function AiCompanion({
   const [isSending, setIsSending] = useState(false)
   const [pendingMessage, setPendingMessage] = useState<StudyMessage | null>(null)
   const [sendError, setSendError] = useState('')
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const stickRef = useRef(true) // 是否贴底跟随（用户上翻回看时为 false）
+  const didInitRef = useRef(false) // 首次挂载时强制贴底一次
+  const turnRefs = useRef<Map<string, HTMLElement>>(new Map())
+  const [activeTurnIdx, setActiveTurnIdx] = useState(0)
   const canSend = input.trim().length > 0 && !isSending
   const panelClassName = ['ai-panel', isCollapsed ? 'is-collapsed' : '', className].filter(Boolean).join(' ')
   const modeMessages = messages.filter((message) => (message.mode ?? 'chat') === mode)
@@ -149,6 +154,60 @@ export function AiCompanion({
   const visibleMessages: StudyMessage[] = placeholder
     ? [...modeMessages, pendingMessage as StudyMessage, placeholder]
     : modeMessages
+
+  const userTurns = visibleMessages.filter((message) => message.role === 'user')
+
+  function updateActiveTurn() {
+    const root = scrollRef.current
+    if (!root) return
+    const rootTop = root.getBoundingClientRect().top
+    let next = 0
+    userTurns.forEach((message, index) => {
+      const node = turnRefs.current.get(message.id)
+      if (node && node.getBoundingClientRect().top - rootTop <= 24) next = index
+    })
+    setActiveTurnIdx(next)
+  }
+
+  function handleScroll() {
+    const el = scrollRef.current
+    if (!el) return
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    updateActiveTurn()
+  }
+
+  function jumpTo(messageId: string) {
+    const node = turnRefs.current.get(messageId)
+    if (!node) return
+    node.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    stickRef.current = false // 跳转后不要被后续流式增量拉回底部
+  }
+
+  // 智能粘底：首次挂载强制贴底；之后仅在用户本就贴底时跟随流式增量
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    if (!didInitRef.current) {
+      el.scrollTop = el.scrollHeight
+      didInitRef.current = true
+      return
+    }
+    if (stickRef.current) el.scrollTop = el.scrollHeight
+  }, [visibleMessages.length, streamingMessage?.content])
+
+  // 切 Chat/Agent：重新贴底并重算当前轮
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    stickRef.current = true
+    el.scrollTop = el.scrollHeight
+    updateActiveTurn()
+  }, [mode])
+
+  // 消息增减后当前轮索引可能漂移，重算
+  useEffect(() => {
+    updateActiveTurn()
+  }, [visibleMessages.length])
 
   async function sendMessage() {
     const trimmed = input.trim()
@@ -210,6 +269,14 @@ export function AiCompanion({
       <article
         className={`chat-message ${message.role === 'user' ? 'is-user' : ''} ${message.id === 'local-thinking' ? 'is-pending' : ''}`}
         key={message.id}
+        ref={
+          message.role === 'user'
+            ? (node) => {
+                if (node) turnRefs.current.set(message.id, node)
+                else turnRefs.current.delete(message.id)
+              }
+            : undefined
+        }
       >
         {message.role === 'assistant' && renderToolEvents(message.toolEvents ?? [])}
         {message.role === 'assistant' ? (
@@ -303,7 +370,8 @@ export function AiCompanion({
         </button>
       </div>
 
-      <div className="ai-scroll">
+      <div className="ai-scroll-wrap">
+        <div className="ai-scroll" ref={scrollRef} onScroll={handleScroll}>
         <section className={`companion-card ${mode === 'agent' ? 'is-agent-mode' : ''}`}>
           <div className="companion-orb">
             {mode === 'chat' ? <Bot size={37} /> : <Sparkles size={37} />}
@@ -379,6 +447,21 @@ export function AiCompanion({
             <Check size={17} />
             <span>已应用：{proposal.title}</span>
           </section>
+        )}
+        </div>
+        {userTurns.length >= 1 && (
+          <div className="chat-turn-rail" role="navigation" aria-label="跳转到某一轮对话">
+            {userTurns.map((message, index) => (
+              <button
+                key={message.id}
+                type="button"
+                className={['chat-turn-dot', index === activeTurnIdx ? 'is-active' : ''].filter(Boolean).join(' ')}
+                data-tooltip={message.content.slice(0, 40) + (message.content.length > 40 ? '…' : '')}
+                aria-label={`跳转到第 ${index + 1} 轮提问`}
+                onClick={() => jumpTo(message.id)}
+              />
+            ))}
+          </div>
         )}
       </div>
 

@@ -1,4 +1,6 @@
-import { type ChangeEvent, type FormEvent, useEffect, useState } from 'react'
+import { Suspense, lazy, type ChangeEvent, type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import katex from 'katex'
+import 'katex/dist/katex.min.css'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
@@ -9,8 +11,10 @@ import {
   Brain,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Circle,
   CircleAlert,
   Clock3,
   ExternalLink,
@@ -28,18 +32,23 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  SlidersHorizontal,
   Sparkles,
   Target,
   TimerReset,
   Trash2,
   Upload,
   X,
+  XCircle,
 } from 'lucide-react'
+import { formatReviewDays, reviewSessionDays } from '../utils/reviewSchedule'
 import type {
+  AdjustmentProposal,
   AgentJob,
   ArchiveItem,
   Course,
   CourseOnboarding,
+  DailyProgress,
   ExternalSource,
   KnowledgePoint,
   LearningModule,
@@ -47,12 +56,18 @@ import type {
   MaterialMemory,
   MaterialPreview,
   McpServer,
+  MockAnswer,
+  MockResultRecord,
   ModelProfile,
+  PlanParamsAdjustRequest,
   PlanTask,
+  PracticeAnswerRecord,
   QuizQuestion,
   StudyGuide,
   StudyWorkedExample,
+  StudyWorkspace,
   StrategyDocuments,
+  TimeLogEntry,
   UiFont,
   UiFontSize,
   WrongAnswer,
@@ -68,16 +83,23 @@ import {
   submitCourseExternalSource,
 } from '../api'
 import { SettingsView } from './SettingsView'
+import { PlanningView } from './PlanningView'
+
+const CourseMindMapView = lazy(() => import('./CourseMindMapView').then((module) => ({ default: module.CourseMindMapView })))
 
 type ModuleViewProps = {
   activeModule: LearningModule
   course: Course
+  courses?: Course[]
+  courseWorkspaces?: Record<string, StudyWorkspace>
   courseProgress: number
   completedTasks: number
   tasks: PlanTask[]
   knowledgePoints: KnowledgePoint[]
   practiceQuestions: QuizQuestion[]
   mockQuestions: QuizQuestion[]
+  practiceAnswers?: Record<string, PracticeAnswerRecord>
+  mockResult?: MockResultRecord | null
   materials: Material[]
   materialMemory?: MaterialMemory
   assessmentProfile: {
@@ -124,6 +146,7 @@ type ModuleViewProps = {
     targetText: string
     dailyHours: number
     days: number
+    reviewCount: number
     examFormat: string
     remarks: string
   }) => Promise<void>
@@ -135,8 +158,12 @@ type ModuleViewProps = {
     reviewPlanVersion: number
     coursePromptVersion: number
   }) => Promise<void>
+  onRefreshWorkspace: () => Promise<void>
+  onRepairStrategyGeneration: () => Promise<void>
   onSaveCoursePrompt: (coursePrompt: string, version: number) => Promise<void>
   onMaterialPreviewOpenChange: (isOpen: boolean) => void
+  materialPreviewPath: string | null
+  onMaterialPreviewRequestHandled: () => void
   onSubmitPractice: (
     questionId: string,
     answerIndex: number,
@@ -153,17 +180,30 @@ type ModuleViewProps = {
     mastery: number
     generatedSimilarCount: number
   }>
-  onSubmitMock: (answers: Record<string, number>) => Promise<{
+  onSubmitMock: (answers: Record<string, MockAnswer>) => Promise<{
     score: number
     total: number
-    results: Array<{ id: string; correct: boolean; explanation: string; mastery: number; generatedSimilarCount: number }>
+    results: Array<{ id: string; correct: boolean; earnedScore?: number; explanation: string; mastery: number; generatedSimilarCount: number }>
   }>
+  onClearPracticeAnswer?: (questionId: string) => Promise<void> | void
+  onClearMockResult?: () => Promise<void> | void
+  onActiveStudyTaskChange?: (taskId: string | null) => void
+  planStartDate?: string
+  timeLog?: TimeLogEntry[]
+  dailyProgress?: DailyProgress
+  pendingProposals?: AdjustmentProposal[]
+  onRecordTime?: (taskId: string | null, minutes: number, date?: string, note?: string) => Promise<void>
+  onDeleteTime?: (entryId: string) => Promise<void>
+  onApplyProposal?: (proposalId: string) => Promise<void>
+  onDismissProposal?: (proposalId: string) => Promise<void>
+  onAdjustPlanParams?: (payload: PlanParamsAdjustRequest) => Promise<void>
 }
 
 const moduleTitles: Record<LearningModule, { title: string; subtitle: string }> = {
   overview: { title: '学习总览', subtitle: '先看全局，再攻重点' },
   materials: { title: '资料库', subtitle: '课程资料、真题和解析记录' },
-  strategy: { title: '复习策略', subtitle: '总计划与课程级 AI 指令' },
+  planning: { title: '规划', subtitle: '按月查看每日复习节奏' },
+  mindmap: { title: '知识地图', subtitle: '无限画布里的课程结构和薄弱点' },
   plan: { title: '数据结构 · 复习主线', subtitle: '根据你的掌握度动态排序' },
   practice: { title: '刷题练习', subtitle: '围绕高权重薄弱点进行定向训练' },
   mock: { title: '模拟卷演练', subtitle: '在接近真实考试的节奏里验证掌握度' },
@@ -182,6 +222,7 @@ type CourseSetupDraft = {
   targetTextIsCustom: boolean
   targetScore: string
   days: string
+  reviewCount: string
   dailyHours: string
   examFormat: string
   remarks: string
@@ -194,6 +235,23 @@ function courseSetupDraftKey(courseId: string) {
 function defaultTargetText(targetScore: string | number) {
   const normalizedScore = String(targetScore).trim()
   return normalizedScore ? `保证 ${normalizedScore} 分` : ''
+}
+
+function calculateReviewDaysFromExamDate(examDate: string, now = new Date()) {
+  const match = examDate.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)
+  if (!match) return null
+
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const examDay = new Date(year, month - 1, day)
+  if (examDay.getFullYear() !== year || examDay.getMonth() !== month - 1 || examDay.getDate() !== day) {
+    return null
+  }
+
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const dayMilliseconds = 24 * 60 * 60 * 1000
+  return Math.min(30, Math.max(1, Math.ceil((examDay.getTime() - today.getTime()) / dayMilliseconds)))
 }
 
 function isDefaultTargetText(targetText: string) {
@@ -212,6 +270,7 @@ function readCourseSetupDraft(courseId: string): CourseSetupDraft | null {
       || typeof parsedDraft.targetTextIsCustom !== 'boolean'
       || typeof parsedDraft.targetScore !== 'string'
       || typeof parsedDraft.days !== 'string'
+      || typeof parsedDraft.reviewCount !== 'string'
       || typeof parsedDraft.dailyHours !== 'string'
       || typeof parsedDraft.examFormat !== 'string'
       || typeof parsedDraft.remarks !== 'string'
@@ -311,8 +370,8 @@ function TaskRow({
         </div>
         <p>{task.description}</p>
         {guidePreview && <small>速成讲解：{guidePreview}</small>}
+        {task.schedulingReason && <small className="task-scheduling-reason">为什么排在这：{task.schedulingReason}</small>}
         {task.contentQualityWarning && <small className="task-content-warning">{task.contentQualityWarning}</small>}
-        <small>来源：{task.source}</small>
       </div>
       <div className="task-progress">
         <span><Clock3 size={14} /> 预计 {task.duration} 分钟</span>
@@ -340,6 +399,7 @@ function OverviewView({
   knowledgePoints,
   diagnostic,
   assessmentProfile,
+  dailyProgress,
   onModuleChange,
   onStudyTask,
 }: Pick<
@@ -351,13 +411,17 @@ function OverviewView({
   | 'knowledgePoints'
   | 'diagnostic'
   | 'assessmentProfile'
+  | 'dailyProgress'
   | 'onModuleChange'
 > & {
   onStudyTask: (taskId: string) => void
 }) {
-  const firstDayTasks = tasks.filter((task) => task.day === 1)
-  const firstDayMinutes = firstDayTasks.reduce((sum, task) => sum + task.duration, 0)
-  const firstDayCompleted = firstDayTasks.filter((task) => task.status === 'completed').length
+  // “今天”对应第几天由 dailyProgress.todayDay 决定，不能写死第 1 天，
+  // 否则学到第 2 天及以后时，总览仍只显示第 1 天的任务（看起来“课程不完全”）。
+  const todayDay = dailyProgress?.todayDay ?? 1
+  const todayTasks = tasks.filter((task) => task.day === todayDay)
+  const todayMinutes = todayTasks.reduce((sum, task) => sum + task.duration, 0)
+  const todayCompleted = todayTasks.filter((task) => task.status === 'completed').length
 
   return (
     <div className="module-page overview-page">
@@ -391,7 +455,7 @@ function OverviewView({
         <article className="metric-card">
           <span>今日可用</span>
           <strong>{course.dailyHours}<small>h</small></strong>
-          <p><Clock3 size={14} /> 已安排 {Math.floor(firstDayMinutes / 60)} 小时</p>
+          <p><Clock3 size={14} /> 已安排 {Math.floor(todayMinutes / 60)} 小时</p>
         </article>
       </section>
 
@@ -425,10 +489,10 @@ function OverviewView({
             <span className="eyebrow">今天的主线</span>
             <h2>先保底，再冲分</h2>
           </div>
-          <span className="plan-summary">{firstDayCompleted}/{firstDayTasks.length} 已完成</span>
+          <span className="plan-summary">{todayCompleted}/{todayTasks.length} 已完成</span>
         </header>
         <div className="task-list">
-          {firstDayTasks.map((task) => (
+          {todayTasks.map((task) => (
             <TaskRow
               key={task.id}
               task={task}
@@ -442,23 +506,513 @@ function OverviewView({
   )
 }
 
+function RebalanceProposalCard({
+  proposal,
+  onApply,
+  onDismiss,
+}: {
+  proposal: AdjustmentProposal
+  onApply: (proposalId: string) => Promise<void> | void
+  onDismiss: (proposalId: string) => Promise<void> | void
+}) {
+  const [pending, setPending] = useState<'apply' | 'dismiss' | null>(null)
+  const before = (proposal.before ?? {}) as { totalMinutes?: number; tasks?: unknown[] }
+  const after = (proposal.after ?? {}) as { totalMinutes?: number; tasks?: unknown[] }
+  const beforeMinutes = typeof before.totalMinutes === 'number' ? before.totalMinutes : null
+  const afterMinutes = typeof after.totalMinutes === 'number' ? after.totalMinutes : null
+
+  async function handleApply() {
+    setPending('apply')
+    try {
+      await onApply(proposal.id)
+    } finally {
+      setPending(null)
+    }
+  }
+
+  async function handleDismiss() {
+    setPending('dismiss')
+    try {
+      await onDismiss(proposal.id)
+    } finally {
+      setPending(null)
+    }
+  }
+
+  return (
+    <article className="rebalance-proposal">
+      <header>
+        <span className="rebalance-badge"><TimerReset size={14} /> 计划调整建议</span>
+        <h4>{proposal.title}</h4>
+      </header>
+      <div className="rebalance-body">
+        <p><strong>原因：</strong>{proposal.reason}</p>
+        <p><strong>效果：</strong>{proposal.impact}</p>
+        {beforeMinutes !== null && afterMinutes !== null && beforeMinutes !== afterMinutes && (
+          <p className="rebalance-delta">
+            计划总时长：{beforeMinutes}m → <strong>{afterMinutes}m</strong>
+            （{afterMinutes > beforeMinutes ? `+${afterMinutes - beforeMinutes}` : afterMinutes - beforeMinutes}m）
+          </p>
+        )}
+      </div>
+      <footer>
+        <button className="secondary-button" type="button" disabled={pending !== null} onClick={handleDismiss}>
+          {pending === 'dismiss' ? <LoaderCircle className="is-spinning" size={15} /> : <X size={15} />}
+          暂不调整
+        </button>
+        <button className="primary-button" type="button" disabled={pending !== null} onClick={handleApply}>
+          {pending === 'apply' ? <LoaderCircle className="is-spinning" size={15} /> : <Check size={15} />}
+          采纳调整
+        </button>
+      </footer>
+    </article>
+  )
+}
+
+type PlanDraft = {
+  duration: number
+  day: number
+  removed: boolean
+}
+
+function AdjustTodayPlanDialog({
+  open,
+  onClose,
+  tasks,
+  knowledgePoints,
+  dailyProgress,
+  onTasksChange,
+  onRefreshWorkspace,
+}: {
+  open: boolean
+  onClose: () => void
+  tasks: PlanTask[]
+  knowledgePoints?: KnowledgePoint[]
+  dailyProgress?: DailyProgress
+  onTasksChange: (tasks: PlanTask[]) => void
+  onRefreshWorkspace: () => Promise<void> | void
+}) {
+  const todayDay = dailyProgress?.todayDay ?? 1
+  const focusTasks = tasks.filter((task) => (task.day ?? todayDay) <= todayDay)
+  const otherTasks = tasks.filter((task) => (task.day ?? todayDay) > todayDay)
+  // 前置依赖提示：任务草稿 day 早于其未完成前置知识点任务的最大 day 时，行内提示会被后端自动顺延。
+  const prereqGateByTask: Record<string, number> = {}
+  if (knowledgePoints?.length) {
+    const tasksByKp = new Map<string, PlanTask[]>()
+    for (const task of tasks) {
+      if (!task.knowledgePointId) continue
+      tasksByKp.set(task.knowledgePointId, [...(tasksByKp.get(task.knowledgePointId) ?? []), task])
+    }
+    for (const task of tasks) {
+      const point = knowledgePoints.find((item) => item.id === task.knowledgePointId)
+      if (!point?.prerequisites?.length) continue
+      let gateDay = 0
+      for (const prereqId of point.prerequisites) {
+        for (const prereqTask of tasksByKp.get(prereqId) ?? []) {
+          if (prereqTask.status === 'completed') continue
+          gateDay = Math.max(gateDay, prereqTask.day ?? todayDay)
+        }
+      }
+      if (gateDay > 0) prereqGateByTask[task.id] = gateDay
+    }
+  }
+  const [drafts, setDrafts] = useState<Record<string, PlanDraft>>({})
+  const [pulledTaskId, setPulledTaskId] = useState('')
+  const [isAiReplanning, setIsAiReplanning] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    const nextDrafts: Record<string, PlanDraft> = {}
+    for (const task of tasks) {
+      nextDrafts[task.id] = { duration: task.duration, day: task.day ?? todayDay, removed: false }
+    }
+    setDrafts(nextDrafts)
+    setPulledTaskId('')
+  }, [open, tasks])
+
+  if (!open) return null
+
+  function patchTask(taskId: string, patch: Partial<PlanDraft>) {
+    setDrafts((current) => ({
+      ...current,
+      [taskId]: { ...(current[taskId] ?? { duration: 0, day: todayDay, removed: false }), ...patch },
+    }))
+  }
+
+  function applyEdits() {
+    const remaining: PlanTask[] = []
+    for (const task of tasks) {
+      const draft = drafts[task.id]
+      if (!draft || draft.removed) continue
+      const nextDay = Math.max(1, Math.min(30, Number(draft.day) || task.day || todayDay))
+      const nextDuration = Math.max(5, Math.min(720, Number(draft.duration) || task.duration))
+      remaining.push({ ...task, day: nextDay, duration: nextDuration })
+    }
+    remaining.sort((left, right) => (left.day ?? todayDay) - (right.day ?? todayDay) || left.order - right.order)
+    const dayOrder: Record<number, number> = {}
+    for (const task of remaining) {
+      const taskDay = task.day ?? todayDay
+      dayOrder[taskDay] = (dayOrder[taskDay] ?? 0) + 1
+      task.order = dayOrder[taskDay]
+    }
+    onTasksChange(remaining)
+    onClose()
+  }
+
+  async function askAiReplan() {
+    setIsAiReplanning(true)
+    try {
+      await onRefreshWorkspace()
+    } finally {
+      setIsAiReplanning(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="adjust-plan-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="adjust-plan-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="adjust-plan-head">
+          <div>
+            <h2 id="adjust-plan-title">调整今日计划</h2>
+            <p>
+              第 {todayDay} 天
+              {dailyProgress ? ` · 已学 ${dailyProgress.spentToday}m / 计划 ${dailyProgress.plannedToday}m · 剩余 ${dailyProgress.remaining}m` : ''}
+            </p>
+          </div>
+          <button className="icon-close" type="button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </header>
+
+        <div className="adjust-plan-body">
+          <section className="adjust-plan-group">
+            <span className="adjust-plan-group-title">今天及之前的任务</span>
+            {focusTasks.length === 0 && <p className="adjust-plan-empty">今天没有安排任务。</p>}
+            {focusTasks.map((task) => {
+              const draft = drafts[task.id] ?? { duration: task.duration, day: task.day, removed: false }
+              return (
+                <div className={`adjust-plan-row ${draft.removed ? 'is-removed' : ''}`} key={task.id}>
+                  <label className="adjust-plan-remove">
+                    <input
+                      type="checkbox"
+                      checked={draft.removed}
+                      onChange={(event) => patchTask(task.id, { removed: event.target.checked })}
+                    />
+                  </label>
+                  <div className="adjust-plan-row-title">
+                    <strong>{task.title}</strong>
+                    <small>第 {task.day} 天 · 当前 {task.duration}m</small>
+                  </div>
+                  <label className="adjust-plan-field">
+                    <span>时长(m)</span>
+                    <input
+                      type="number"
+                      min={5}
+                      max={720}
+                      value={draft.duration}
+                      onChange={(event) => patchTask(task.id, { duration: Number(event.target.value) })}
+                    />
+                  </label>
+                  <label className="adjust-plan-field">
+                    <span>移至第几天</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      value={draft.day}
+                      onChange={(event) => patchTask(task.id, { day: Number(event.target.value) })}
+                    />
+                    {(prereqGateByTask[task.id] ?? 0) > draft.day && (
+                      <small className="adjust-plan-prereq-hint">
+                        有未完成前置知识点，保存后将被自动顺延到第 {prereqGateByTask[task.id]} 天之后
+                      </small>
+                    )}
+                  </label>
+                </div>
+              )
+            })}
+          </section>
+
+          {otherTasks.length > 0 && (
+            <section className="adjust-plan-pull">
+              <span className="adjust-plan-group-title">把后续任务拉到今天</span>
+              <div className="adjust-plan-pull-row">
+                <select value={pulledTaskId} onChange={(event) => setPulledTaskId(event.target.value)}>
+                  <option value="">选择一个任务…</option>
+                  {otherTasks.map((task) => (
+                    <option key={task.id} value={task.id}>
+                      第 {task.day} 天 · {task.title}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={!pulledTaskId}
+                  onClick={() => {
+                    if (pulledTaskId) patchTask(pulledTaskId, { day: todayDay })
+                    setPulledTaskId('')
+                  }}
+                >
+                  拉到今天
+                </button>
+              </div>
+            </section>
+          )}
+        </div>
+
+        <footer className="adjust-plan-actions">
+          <button className="secondary-button" type="button" disabled={isAiReplanning} onClick={askAiReplan}>
+            {isAiReplanning ? <LoaderCircle className="is-spinning" size={15} /> : <Sparkles size={15} />}
+            让 AI 重新规划
+          </button>
+          <div className="adjust-plan-actions-right">
+            <button className="secondary-button" type="button" onClick={onClose}>取消</button>
+            <button className="primary-button" type="button" onClick={applyEdits}>
+              <Check size={15} /> 保存调整
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  )
+}
+
+function AdjustPlanParamsDialog({
+  open,
+  onClose,
+  course,
+  onboarding,
+  dailyProgress,
+  onAdjustPlanParams,
+}: {
+  open: boolean
+  onClose: () => void
+  course: Course
+  onboarding?: CourseOnboarding
+  dailyProgress?: DailyProgress
+  onAdjustPlanParams: (payload: PlanParamsAdjustRequest) => Promise<void>
+}) {
+  const currentExam = course.examDate ?? ''
+  const currentHours = course.dailyHours ?? 2
+  const currentDays = onboarding?.days ?? calculateReviewDaysFromExamDate(currentExam) ?? 14
+  const todayDay = dailyProgress?.todayDay ?? 1
+
+  const [examDate, setExamDate] = useState(currentExam)
+  const [days, setDays] = useState(String(currentDays))
+  const [dailyHours, setDailyHours] = useState(String(currentHours))
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!open) return
+    setExamDate(currentExam)
+    setDays(String(currentDays))
+    setDailyHours(String(currentHours))
+    setError('')
+  }, [open, currentExam, currentDays, currentHours])
+
+  if (!open) return null
+
+  const trimmedExam = examDate.trim()
+  const nextDays = Math.max(1, Math.min(30, Number(days) || currentDays))
+  const nextHours = Math.max(0.5, Math.min(12, Number(dailyHours) || currentHours))
+  const examChanged = trimmedExam !== currentExam.trim()
+  const daysChanged = nextDays !== currentDays
+  const hoursChanged = Math.abs(nextHours - currentHours) > 1e-9
+  const willReplan = daysChanged || hoursChanged
+  const hasChange = examChanged || daysChanged || hoursChanged
+  const overCompress = nextDays < todayDay
+  const estimatedFromExam = trimmedExam ? calculateReviewDaysFromExamDate(trimmedExam) : null
+
+  async function submit() {
+    if (!hasChange || isSubmitting) return
+    setError('')
+    setIsSubmitting(true)
+    try {
+      const payload: PlanParamsAdjustRequest = {}
+      if (examChanged) payload.examDate = trimmedExam
+      if (daysChanged) payload.days = nextDays
+      if (hoursChanged) payload.dailyHours = nextHours
+      await onAdjustPlanParams(payload)
+      onClose()
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : '调整失败，请稍后再试。')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="adjust-plan-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="adjust-plan-params-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="adjust-plan-head">
+          <div>
+            <h2 id="adjust-plan-params-title">调整复习参数</h2>
+            <p>修改考试日期、复习天数或每日时间。已完成任务与已生成讲义不受影响。</p>
+          </div>
+          <button className="icon-close" type="button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </header>
+
+        <div className="adjust-plan-body">
+          <section className="adjust-plan-group">
+            <span className="adjust-plan-group-title">复习参数</span>
+            <label className="adjust-plan-field">
+              <span>考试日期</span>
+              <input type="date" value={examDate} onChange={(event) => setExamDate(event.target.value)} />
+            </label>
+            {examChanged && estimatedFromExam !== null && !daysChanged && (
+              <p className="adjust-plan-empty">按新考试日期推算约 {estimatedFromExam} 天，如需同步请手动改复习天数。</p>
+            )}
+            <label className="adjust-plan-field">
+              <span>复习天数（1–30）</span>
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={days}
+                onChange={(event) => setDays(event.target.value)}
+              />
+            </label>
+            <label className="adjust-plan-field">
+              <span>每日复习时间（小时，0.5–12）</span>
+              <input
+                type="number"
+                min={0.5}
+                max={12}
+                step={0.5}
+                value={dailyHours}
+                onChange={(event) => setDailyHours(event.target.value)}
+              />
+            </label>
+          </section>
+
+          <section className="adjust-plan-group">
+            <span className="adjust-plan-group-title">影响预估</span>
+            <p className="adjust-plan-empty">
+              当前：第 {todayDay} 天 · 共 {currentDays} 天 · 每日 {currentHours}h（{Math.round(currentHours * 60)}m）
+            </p>
+            {(daysChanged || hoursChanged) && (
+              <p className="adjust-plan-empty">
+                调整后：共 {nextDays} 天 · 每日 {nextHours}h（{Math.round(nextHours * 60)}m）
+              </p>
+            )}
+            {overCompress && (
+              <p className="today-time-warning"><CircleAlert size={14} /> 剩余任务会被压缩到近期，可能超额。</p>
+            )}
+            {willReplan ? (
+              <p className="adjust-plan-empty">天数或每日时间变化，将生成「重新编排方案」，预览后再决定是否采纳。</p>
+            ) : examChanged ? (
+              <p className="adjust-plan-empty">仅考试日期变化，保存后刷新复习计划文档，不重排任务。</p>
+            ) : null}
+          </section>
+        </div>
+
+        {error && (
+          <p className="today-time-warning" role="alert"><CircleAlert size={14} /> {error}</p>
+        )}
+
+        <footer className="adjust-plan-actions">
+          <button className="secondary-button" type="button" disabled={isSubmitting} onClick={onClose}>取消</button>
+          <button className="primary-button" type="button" disabled={!hasChange || isSubmitting} onClick={submit}>
+            {isSubmitting ? <LoaderCircle className="is-spinning" size={15} /> : <SlidersHorizontal size={15} />}
+            {willReplan ? '生成重新编排方案' : '保存'}
+          </button>
+        </footer>
+      </section>
+    </div>
+  )
+}
+
 function PlanView({
   course,
   tasks,
+  knowledgePoints,
+  onboarding,
   strategyGenerationJob,
   onModuleChange,
+  onRefreshWorkspace,
+  onRepairStrategyGeneration,
   onStudyTask,
-}: Pick<ModuleViewProps, 'course' | 'tasks' | 'strategyGenerationJob' | 'onModuleChange'> & {
+  dailyProgress,
+  pendingProposals,
+  onTasksChange,
+  onApplyProposal,
+  onDismissProposal,
+  onAdjustPlanParams,
+}: Pick<
+  ModuleViewProps,
+  | 'course'
+  | 'tasks'
+  | 'knowledgePoints'
+  | 'onboarding'
+  | 'strategyGenerationJob'
+  | 'onModuleChange'
+  | 'onRefreshWorkspace'
+  | 'onRepairStrategyGeneration'
+  | 'dailyProgress'
+  | 'pendingProposals'
+  | 'onTasksChange'
+  | 'onApplyProposal'
+  | 'onDismissProposal'
+  | 'onAdjustPlanParams'
+> & {
   onStudyTask: (taskId: string) => void
 }) {
+  const [isRefreshingGeneration, setIsRefreshingGeneration] = useState(false)
+  const [isRepairingGeneration, setIsRepairingGeneration] = useState(false)
+  const [generationActionError, setGenerationActionError] = useState('')
   const activeGenerationJob = strategyGenerationJob?.courseId === course.id ? strategyGenerationJob : null
   const isGeneratingPlan = activeGenerationJob && ['queued', 'running'].includes(activeGenerationJob.job.status)
-  const firstDayTasks = tasks.filter((task) => task.day === 1)
-  const firstDayMinutes = firstDayTasks.reduce((sum, task) => sum + task.duration, 0)
-  const firstDayCompleted = firstDayTasks
-    .filter((task) => task.status === 'completed')
-    .reduce((sum, task) => sum + task.duration, 0)
+  const pendingContentCount = tasks.filter((task) => task.contentQualityWarning && !task.studyGuide).length
+  const completedContentCount = tasks.filter((task) => task.studyGuide).length
+  const [isAdjustDialogOpen, setIsAdjustDialogOpen] = useState(false)
+  const [isParamsDialogOpen, setIsParamsDialogOpen] = useState(false)
+  const todayDay = dailyProgress?.todayDay ?? 1
+  const todayTasks = tasks.filter((task) => task.day === todayDay)
+  const todayMinutes = todayTasks.reduce((sum, task) => sum + task.duration, 0)
+  const spentToday = dailyProgress?.spentToday ?? 0
+  const plannedToday = dailyProgress?.plannedToday ?? todayMinutes
+  const remainingToday = dailyProgress?.remaining ?? Math.max(0, todayMinutes - spentToday)
+  const overdueCount = dailyProgress?.overdue?.length ?? 0
+  const overBudget = Boolean(dailyProgress?.overBudget)
+  const progressPercent = plannedToday > 0 ? Math.min(100, Math.round((spentToday / plannedToday) * 100)) : 0
+  const activeProposals = pendingProposals ?? []
   const highPriorityCount = tasks.filter((task) => task.priority === 'high' && task.status !== 'completed').length
+
+  async function refreshGenerationStatus() {
+    setIsRefreshingGeneration(true)
+    setGenerationActionError('')
+    try {
+      await onRefreshWorkspace()
+    } catch (refreshError) {
+      setGenerationActionError(refreshError instanceof Error ? refreshError.message : '刷新生成状态失败')
+    } finally {
+      setIsRefreshingGeneration(false)
+    }
+  }
+
+  async function repairGeneration() {
+    setIsRepairingGeneration(true)
+    setGenerationActionError('')
+    try {
+      await onRepairStrategyGeneration()
+    } catch (repairError) {
+      setGenerationActionError(repairError instanceof Error ? repairError.message : '重新生成失败')
+    } finally {
+      setIsRepairingGeneration(false)
+    }
+  }
 
   return (
     <div className="module-page plan-page">
@@ -468,51 +1022,103 @@ function PlanView({
           <h1>{course.name} · 复习主线</h1>
           <p>优先完成标记为高优先级的任务。每次练习后，计划会产生新的调整建议。</p>
         </div>
-        <button className="secondary-button" type="button">
-          <TimerReset size={16} /> 调整今日计划
-        </button>
+        <div className="plan-heading-actions" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <button className="secondary-button" type="button" onClick={() => setIsParamsDialogOpen(true)}>
+            <SlidersHorizontal size={16} /> 调整复习参数
+          </button>
+          <button className="secondary-button" type="button" onClick={() => setIsAdjustDialogOpen(true)}>
+            <TimerReset size={16} /> 调整今日计划
+          </button>
+        </div>
       </section>
 
-      {activeGenerationJob && (
-        <section className={`plan-generation-status is-${activeGenerationJob.job.status}`}>
+      {(activeGenerationJob || pendingContentCount > 0) && (
+        <section className={`plan-generation-status is-${activeGenerationJob?.job.status ?? 'partial'}`}>
           <div className="plan-generation-status-icon">
-            {isGeneratingPlan ? <RefreshCw className="is-spinning" size={20} /> : <CheckCircle2 size={20} />}
+            {isGeneratingPlan || !activeGenerationJob ? <RefreshCw className={isGeneratingPlan ? 'is-spinning' : ''} size={20} /> : <CheckCircle2 size={20} />}
           </div>
           <div>
             <strong>
-              {activeGenerationJob.job.status === 'failed'
+              {activeGenerationJob?.job.status === 'failed'
                 ? '复习主线后台生成失败'
-                : activeGenerationJob.job.status === 'completed'
+                : activeGenerationJob?.job.status === 'completed'
                   ? '复习主线已生成完成'
-                  : '复习主线正在后台生成'}
+                  : activeGenerationJob
+                    ? '复习主线正在后台生成'
+                    : '复习主线内容正在分批补齐'}
             </strong>
             <p>
-              已运行 {activeGenerationJob.elapsedSeconds} 秒
-              {activeGenerationJob.job.status === 'running' ? ` · 第 ${activeGenerationJob.job.attempts} 次执行` : ''}
-              {activeGenerationJob.job.status === 'queued' ? ' · 等待后台 worker 接手' : ''}
+              {activeGenerationJob
+                ? `已运行 ${activeGenerationJob.elapsedSeconds} 秒 · 已完成 ${completedContentCount}/${completedContentCount + pendingContentCount} 节`
+                : `已完成 ${completedContentCount} 项，待补齐 ${pendingContentCount} 项`}
+              {activeGenerationJob?.job.status === 'running' ? ` · 第 ${activeGenerationJob.job.attempts} 次执行` : ''}
+              {activeGenerationJob?.job.status === 'queued' ? ' · 等待后台 worker 接手' : ''}
             </p>
-            {activeGenerationJob.job.error && <p role="alert">{activeGenerationJob.job.error}</p>}
+            {activeGenerationJob?.job.error && <p role="alert">{activeGenerationJob.job.error}</p>}
+            {generationActionError && <p role="alert">{generationActionError}</p>}
+          </div>
+          <div className="plan-generation-actions">
+            <button className="secondary-button" type="button" disabled={isRefreshingGeneration} onClick={refreshGenerationStatus}>
+              <RefreshCw className={isRefreshingGeneration ? 'is-spinning' : ''} size={16} /> {isRefreshingGeneration ? '刷新中' : '刷新状态'}
+            </button>
+            {(activeGenerationJob?.job.status === 'failed' || pendingContentCount > 0) && (
+              <button className="primary-button" type="button" disabled={Boolean(isGeneratingPlan) || isRepairingGeneration} onClick={repairGeneration}>
+                <RotateCcw size={16} /> {isRepairingGeneration ? '正在修复' : '修复生成'}
+              </button>
+            )}
           </div>
         </section>
       )}
 
-      <section className="timeline-summary">
-        <div>
-          <span>第 1 天安排</span>
-          <strong>{Math.floor(firstDayMinutes / 60)}h {firstDayMinutes % 60 ? `${firstDayMinutes % 60}m` : ''}</strong>
+      <section className={`today-time-panel ${overBudget ? 'is-over-budget' : ''}`}>
+        <div className="today-time-stats">
+          <div className="today-time-stat">
+            <span>今天</span>
+            <strong>第 {todayDay} 天</strong>
+          </div>
+          <div className="today-time-stat">
+            <span>已学 / 计划</span>
+            <strong>{spentToday}m / {plannedToday}m</strong>
+          </div>
+          <div className="today-time-stat">
+            <span>{overBudget ? '超出' : '剩余'}</span>
+            <strong>{overBudget ? `${spentToday - plannedToday}m` : `${remainingToday}m`}</strong>
+          </div>
+          <div className="today-time-stat">
+            <span>高优任务</span>
+            <strong>{highPriorityCount} 项</strong>
+          </div>
         </div>
-        <i></i>
-        <div>
-          <span>已完成</span>
-          <strong>{firstDayCompleted}m</strong>
+        <div className="today-time-bar" role="progressbar" aria-valuenow={progressPercent} aria-valuemin={0} aria-valuemax={100}>
+          <i style={{ width: `${progressPercent}%` }}></i>
+          {overBudget && <em>已超额 {spentToday - plannedToday}m，后续可减负</em>}
         </div>
-        <i></i>
-        <div>
-          <span>高优任务</span>
-          <strong>{highPriorityCount} 项</strong>
-        </div>
+        {overdueCount > 0 && (
+          <p className="today-time-warning">
+            <CircleAlert size={14} /> 有 {overdueCount} 项第 {todayDay} 天之前的任务未完成，AI 已生成顺延建议供你确认。
+          </p>
+        )}
         <button type="button" onClick={() => onModuleChange('practice')}>开始定向练习 <ArrowRight size={15} /></button>
       </section>
+
+      {activeProposals.length > 0 && (
+        <section className="rebalance-proposals">
+          <header className="panel-heading">
+            <div>
+              <span className="eyebrow">每日时间核对</span>
+              <h2>AI 建议的滚动调整</h2>
+            </div>
+          </header>
+          {activeProposals.map((proposal) => (
+            <RebalanceProposalCard
+              key={proposal.id}
+              proposal={proposal}
+              onApply={(proposalId) => onApplyProposal?.(proposalId)}
+              onDismiss={(proposalId) => onDismissProposal?.(proposalId)}
+            />
+          ))}
+        </section>
+      )}
 
       <section className="plan-preview">
         <div className="task-list">
@@ -522,7 +1128,10 @@ function PlanView({
               <span>正在生成首批学习任务，完成后会自动刷新到这里。</span>
             </div>
           )}
-          {tasks.map((task) => (
+          {tasks
+            .slice()
+            .sort((a, b) => (a.day ?? 999) - (b.day ?? 999) || a.order - b.order)
+            .map((task) => (
             <TaskRow
               key={task.id}
               task={task}
@@ -532,6 +1141,27 @@ function PlanView({
           ))}
         </div>
       </section>
+
+      <AdjustTodayPlanDialog
+        open={isAdjustDialogOpen}
+        onClose={() => setIsAdjustDialogOpen(false)}
+        tasks={tasks}
+        knowledgePoints={knowledgePoints}
+        dailyProgress={dailyProgress}
+        onTasksChange={(nextTasks) => onTasksChange(nextTasks)}
+        onRefreshWorkspace={onRefreshWorkspace}
+      />
+
+      {onAdjustPlanParams && (
+        <AdjustPlanParamsDialog
+          open={isParamsDialogOpen}
+          onClose={() => setIsParamsDialogOpen(false)}
+          course={course}
+          onboarding={onboarding}
+          dailyProgress={dailyProgress}
+          onAdjustPlanParams={onAdjustPlanParams}
+        />
+      )}
     </div>
   )
 }
@@ -558,15 +1188,17 @@ function CourseOnboardingView({
   const initialTargetScore = savedDraft?.targetScore ?? String(onboarding?.targetScore ?? course.targetScore ?? 60)
   const onboardingTargetTextIsCustom = onboarding?.targetText !== undefined && !isDefaultTargetText(onboarding.targetText)
   const initialTargetTextIsCustom = savedDraft?.targetTextIsCustom ?? onboardingTargetTextIsCustom
+  const initialExamDate = savedDraft?.examDate ?? onboarding?.examDate ?? course.examDate ?? ''
   const [courseName, setCourseName] = useState(savedDraft?.courseName ?? onboarding?.courseName ?? course.name ?? '未命名课程')
-  const [examDate, setExamDate] = useState(savedDraft?.examDate ?? onboarding?.examDate ?? '')
+  const [examDate, setExamDate] = useState(initialExamDate)
   const [targetText, setTargetText] = useState(
     savedDraft?.targetText
       ?? (initialTargetTextIsCustom ? onboarding?.targetText ?? '' : defaultTargetText(initialTargetScore)),
   )
   const [targetTextIsCustom, setTargetTextIsCustom] = useState(initialTargetTextIsCustom)
   const [targetScore, setTargetScore] = useState(initialTargetScore)
-  const [days, setDays] = useState(savedDraft?.days ?? String(onboarding?.days ?? 3))
+  const [days, setDays] = useState(String(calculateReviewDaysFromExamDate(initialExamDate) ?? savedDraft?.days ?? onboarding?.days ?? 3))
+  const [reviewCount, setReviewCount] = useState(savedDraft?.reviewCount ?? String(onboarding?.reviewCount ?? calculateReviewDaysFromExamDate(initialExamDate) ?? savedDraft?.days ?? onboarding?.days ?? 3))
   const [dailyHours, setDailyHours] = useState(savedDraft?.dailyHours ?? String(onboarding?.dailyHours ?? course.dailyHours ?? 2))
   const [examFormat, setExamFormat] = useState(savedDraft?.examFormat ?? onboarding?.examFormat ?? '')
   const [remarks, setRemarks] = useState(savedDraft?.remarks ?? onboarding?.remarks ?? '')
@@ -586,11 +1218,12 @@ function CourseOnboardingView({
       targetTextIsCustom,
       targetScore,
       days,
+      reviewCount,
       dailyHours,
       examFormat,
       remarks,
     })
-  }, [course.id, courseName, dailyHours, days, examDate, examFormat, remarks, targetScore, targetText, targetTextIsCustom])
+  }, [course.id, courseName, dailyHours, days, examDate, examFormat, remarks, reviewCount, targetScore, targetText, targetTextIsCustom])
 
   useEffect(() => {
     if (!isSubmittingDiagnostic) {
@@ -613,14 +1246,21 @@ function CourseOnboardingView({
   async function submitSetup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const parsedTargetScore = Number(targetScore)
-    const parsedDays = Number(days)
+    const calculatedDays = calculateReviewDaysFromExamDate(examDate)
+    const parsedDays = calculatedDays ?? Number(days)
     const parsedDailyHours = Number(dailyHours)
+    const rawReviewCount = Number(reviewCount)
+    const parsedReviewCount = Number.isFinite(rawReviewCount) ? Math.max(1, Math.min(parsedDays, Math.floor(rawReviewCount))) : parsedDays
     if (!hasMaterials) {
       setSetupError('请先到资料库导入复习资料。')
       return
     }
-    if (!courseName.trim() || !Number.isFinite(parsedTargetScore) || !Number.isFinite(parsedDays) || !Number.isFinite(parsedDailyHours)) {
-      setSetupError('请完整填写课程名称、目标分数、复习天数和每日时间。')
+    if (!courseName.trim() || !Number.isFinite(parsedTargetScore) || !Number.isFinite(parsedDays) || !Number.isFinite(parsedDailyHours) || !Number.isFinite(rawReviewCount)) {
+      setSetupError('请完整填写课程名称、目标分数、复习天数、复习次数和每日时间。')
+      return
+    }
+    if (rawReviewCount < 1 || rawReviewCount > parsedDays) {
+      setSetupError(`复习次数应在 1 到 ${parsedDays} 之间。`)
       return
     }
     setIsSavingSetup(true)
@@ -633,6 +1273,7 @@ function CourseOnboardingView({
         targetText: targetText.trim(),
         dailyHours: parsedDailyHours,
         days: parsedDays,
+        reviewCount: parsedReviewCount,
         examFormat: examFormat.trim(),
         remarks: remarks.trim(),
       })
@@ -652,6 +1293,7 @@ function CourseOnboardingView({
       targetTextIsCustom,
       targetScore,
       days,
+      reviewCount,
       dailyHours,
       examFormat,
       remarks,
@@ -663,6 +1305,23 @@ function CourseOnboardingView({
     setTargetScore(nextTargetScore)
     if (!targetTextIsCustom) {
       setTargetText(defaultTargetText(nextTargetScore))
+    }
+  }
+
+  function changeExamDate(nextExamDate: string) {
+    setExamDate(nextExamDate)
+    const calculatedDays = calculateReviewDaysFromExamDate(nextExamDate)
+    if (calculatedDays !== null) {
+      setDays(String(calculatedDays))
+      const oldDays = Number(days)
+      const currentReviewCount = Number(reviewCount)
+      if (Number.isFinite(currentReviewCount) && currentReviewCount === oldDays) {
+        // 仍是「每天复习」默认值 → 随跨度同步，保持向后兼容。
+        setReviewCount(String(calculatedDays))
+      } else if (Number.isFinite(currentReviewCount) && currentReviewCount > calculatedDays) {
+        // 跨度变小后超过上限 → 钳制为新跨度。
+        setReviewCount(String(calculatedDays))
+      }
     }
   }
 
@@ -757,7 +1416,7 @@ function CourseOnboardingView({
           </label>
           <label>
             <span>考试日期</span>
-            <input placeholder="例如 2026-07-30 或 期末周周三" value={examDate} onChange={(event) => setExamDate(event.target.value)} />
+            <input placeholder="例如 2026-07-30 或 期末周周三" value={examDate} onChange={(event) => changeExamDate(event.target.value)} />
           </label>
           <label>
             <span>目标描述</span>
@@ -775,8 +1434,23 @@ function CourseOnboardingView({
             <input type="number" min="0" max="100" value={targetScore} onChange={(event) => changeTargetScore(event.target.value)} />
           </label>
           <label>
-            <span>复习天数</span>
-            <input type="number" min="1" max="14" value={days} onChange={(event) => setDays(event.target.value)} />
+            <span>距考试天数</span>
+            <input type="number" min="1" max="30" value={days} onChange={(event) => setDays(event.target.value)} />
+          </label>
+          <label>
+            <span>复习次数</span>
+            <input type="number" min="1" max={Number(days) || 1} value={reviewCount} onChange={(event) => setReviewCount(event.target.value)} />
+            {(() => {
+              const spanDays = Math.max(1, Math.floor(Number(days) || 1))
+              const count = Math.max(1, Math.min(spanDays, Math.floor(Number(reviewCount) || 1)))
+              const sessionDays = reviewSessionDays(spanDays, count)
+              const interval = count > 1 ? Math.round((spanDays - 1) / (count - 1)) : spanDays
+              return (
+                <small className="review-days-hint">
+                  复习日：{formatReviewDays(sessionDays)}（共 {count} 次{count > 1 ? `，约每 ${interval} 天一次` : ''}）
+                </small>
+              )
+            })()}
           </label>
           <label>
             <span>每天时间</span>
@@ -812,7 +1486,7 @@ function CourseOnboardingView({
               const choices = [...question.options, UNKNOWN_CHOICE_LABEL]
               return (
                 <article className="diagnostic-question" key={question.id}>
-                  <strong>{questionIndex + 1}. {question.prompt}</strong>
+                  <strong>{questionIndex + 1}. <FormulaText text={question.prompt} /></strong>
                   <div className="choice-list">
                     {choices.map((option, optionIndex) => (
                       <button
@@ -822,7 +1496,7 @@ function CourseOnboardingView({
                         onClick={() => setDiagnosticAnswers((current) => ({ ...current, [question.id]: optionIndex }))}
                       >
                         <b>{String.fromCharCode(65 + optionIndex)}</b>
-                        <span>{option}</span>
+                        <span><FormulaText text={option} /></span>
                       </button>
                     ))}
                   </div>
@@ -851,13 +1525,17 @@ function StrategyReviewView({
   strategyGenerationJob,
   onGenerateStrategyDocuments,
   onApproveStrategyDocuments,
-}: Pick<ModuleViewProps, 'course' | 'strategyDocuments' | 'strategyGenerationJob' | 'onGenerateStrategyDocuments' | 'onApproveStrategyDocuments'>) {
+  onRefreshWorkspace,
+  onRepairStrategyGeneration,
+}: Pick<ModuleViewProps, 'course' | 'strategyDocuments' | 'strategyGenerationJob' | 'onGenerateStrategyDocuments' | 'onApproveStrategyDocuments' | 'onRefreshWorkspace' | 'onRepairStrategyGeneration'>) {
   const [reviewPlan, setReviewPlan] = useState(strategyDocuments?.reviewPlan.content ?? '')
   const [coursePrompt, setCoursePrompt] = useState(strategyDocuments?.coursePrompt.content ?? '')
-  const [planMode, setPlanMode] = useState<StrategyPaneMode>('edit')
-  const [promptMode, setPromptMode] = useState<StrategyPaneMode>('edit')
+  const [planMode, setPlanMode] = useState<StrategyPaneMode>('preview')
+  const [promptMode, setPromptMode] = useState<StrategyPaneMode>('preview')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [isRepairing, setIsRepairing] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -899,9 +1577,34 @@ function StrategyReviewView({
     }
   }
 
+  async function refreshWorkspace() {
+    setIsRefreshing(true)
+    setError('')
+    try {
+      await onRefreshWorkspace()
+    } catch (refreshError) {
+      setError(refreshError instanceof Error ? refreshError.message : '刷新生成状态失败')
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  async function repairGeneration() {
+    setIsRepairing(true)
+    setError('')
+    try {
+      await onRepairStrategyGeneration()
+    } catch (repairError) {
+      setError(repairError instanceof Error ? repairError.message : '重新生成失败')
+    } finally {
+      setIsRepairing(false)
+    }
+  }
+
   const documentsReady = Boolean(reviewPlan.trim() && coursePrompt.trim())
   const activeGenerationJob = strategyGenerationJob?.courseId === course.id ? strategyGenerationJob : null
   const isGeneratingPlan = Boolean(activeGenerationJob && ['queued', 'running'].includes(activeGenerationJob.job.status))
+  const hasGenerationFailure = activeGenerationJob?.job.status === 'failed' || Boolean(strategyDocuments?.maintenanceError)
 
   return (
     <div className="module-page strategy-review-page">
@@ -926,6 +1629,22 @@ function StrategyReviewView({
         </section>
       )}
 
+      {documentsReady && hasGenerationFailure && (
+        <section className="strategy-generation-error">
+          <CircleAlert size={20} />
+          <div>
+            <strong>复习主线生成没有完整结束</strong>
+            <p>{activeGenerationJob?.job.error || strategyDocuments?.maintenanceError || '可以重新入队，系统会复用已生成的检查点继续补齐。'}</p>
+          </div>
+          <button className="secondary-button" type="button" disabled={isRefreshing} onClick={refreshWorkspace}>
+            <RefreshCw className={isRefreshing ? 'is-spinning' : ''} size={16} /> {isRefreshing ? '刷新中' : '刷新状态'}
+          </button>
+          <button className="primary-button" type="button" disabled={isRepairing || isGeneratingPlan} onClick={repairGeneration}>
+            <RotateCcw size={16} /> {isRepairing ? '正在修复' : '修复生成'}
+          </button>
+        </section>
+      )}
+
       {documentsReady && <div className="strategy-document-grid">
         <section className="strategy-document-panel">
           <header>
@@ -936,7 +1655,7 @@ function StrategyReviewView({
             </div>
           </header>
           {planMode === 'edit' ? (
-            <textarea value={reviewPlan} onChange={(event) => setReviewPlan(event.target.value)} />
+            <textarea className="strategy-prompt-editor" value={reviewPlan} onChange={(event) => setReviewPlan(event.target.value)} />
           ) : (
             <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reviewPlan}</ReactMarkdown></article>
           )}
@@ -951,7 +1670,7 @@ function StrategyReviewView({
             </div>
           </header>
           {promptMode === 'edit' ? (
-            <textarea value={coursePrompt} onChange={(event) => setCoursePrompt(event.target.value)} />
+            <textarea className="strategy-prompt-editor" value={coursePrompt} onChange={(event) => setCoursePrompt(event.target.value)} />
           ) : (
             <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{coursePrompt}</ReactMarkdown></article>
           )}
@@ -973,13 +1692,15 @@ function StrategyReviewView({
   )
 }
 
-function StrategyView({
+function StrategySection({
   strategyDocuments,
   onSaveCoursePrompt,
 }: Pick<ModuleViewProps, 'strategyDocuments' | 'onSaveCoursePrompt'>) {
   const [coursePrompt, setCoursePrompt] = useState(strategyDocuments?.coursePrompt.content ?? '')
   const [isSaving, setIsSaving] = useState(false)
   const [message, setMessage] = useState('')
+  const [promptMode, setPromptMode] = useState<'edit' | 'preview'>('preview')
+  const [isExpanded, setIsExpanded] = useState(false)
 
   useEffect(() => {
     setCoursePrompt(strategyDocuments?.coursePrompt.content ?? '')
@@ -1000,36 +1721,102 @@ function StrategyView({
   }
 
   if (!strategyDocuments?.reviewPlan.content) {
-    return <div className="module-page empty-module"><FileText size={32} /><h1>尚未生成复习策略</h1></div>
+    return (
+      <section className="strategy-section">
+        <header className="strategy-section-head">
+          <h2><FileText size={18} /> 复习策略</h2>
+        </header>
+        <div className="strategy-section-empty">尚未生成复习策略，资料解析完成后可生成。</div>
+      </section>
+    )
   }
 
   return (
-    <div className="module-page strategy-page">
-      <section className="page-heading-row">
-        <div>
-          <p className="page-kicker"><FileText size={15} /> 课程策略文档</p>
-          <h1>总计划由 AI 维护，课程指令由你维护。</h1>
-          <p>{strategyDocuments.maintenancePending ? 'AI 正在根据最新学习状态维护复习计划。' : strategyDocuments.reviewPlan.changeSummary || '当前策略已同步。'}</p>
+    <section className={`strategy-section${isExpanded ? ' is-expanded' : ''}`}>
+      <header
+        className="strategy-section-head"
+        role="button"
+        aria-expanded={isExpanded}
+        tabIndex={0}
+        onClick={() => setIsExpanded((value) => !value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            setIsExpanded((value) => !value)
+          }
+        }}
+      >
+        <div className="strategy-section-head-text">
+          <h2><FileText size={18} /> 复习策略</h2>
+          <p>{strategyDocuments.maintenancePending ? 'AI 正在根据最新学习状态维护复习计划。' : strategyDocuments.reviewPlan.changeSummary || '总计划由 AI 维护，课程指令由你维护。'}</p>
         </div>
-      </section>
+        <button
+          className="strategy-section-toggle"
+          type="button"
+          aria-label={isExpanded ? '收起复习策略' : '展开复习策略'}
+          onClick={(event) => {
+            event.stopPropagation()
+            setIsExpanded((value) => !value)
+          }}
+        >
+          {isExpanded ? '收起' : '展开'}
+          <ChevronDown size={16} className="strategy-section-chevron" />
+        </button>
+      </header>
+      {isExpanded && (
       <div className="strategy-document-grid">
-        <section className="strategy-document-panel is-readonly">
-          <header><div><span>复习计划 · v{strategyDocuments.reviewPlan.version}</span><strong>AI 维护</strong></div><LockKeyhole size={17} /></header>
-          <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{strategyDocuments.reviewPlan.content}</ReactMarkdown></article>
-        </section>
         <section className="strategy-document-panel">
-          <header><div><span>课程总 Prompt · v{strategyDocuments.coursePrompt.version}</span><strong>用户维护</strong></div></header>
-          <textarea value={coursePrompt} onChange={(event) => setCoursePrompt(event.target.value)} />
-          <footer>
-            <span>{message || strategyDocuments.coursePrompt.changeSummary}</span>
-            <button className="primary-button" type="button" disabled={isSaving} onClick={savePrompt}>
-              <Check size={16} /> {isSaving ? '正在保存' : '保存 Prompt'}
-            </button>
-          </footer>
+          <header>
+            <div>
+              <span>复习计划 · v{strategyDocuments.reviewPlan.version} · AI 维护</span>
+              <strong>总复习计划</strong>
+            </div>
+          </header>
+          <article className="strategy-markdown-preview">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{strategyDocuments.reviewPlan.content}</ReactMarkdown>
+          </article>
+        </section>
+
+        <section className="strategy-document-panel">
+          <header>
+            <div>
+              <span>课程总 Prompt · v{strategyDocuments.coursePrompt.version} · 用户维护</span>
+              <strong>课程级 AI 指令</strong>
+            </div>
+            <div className="strategy-tab-actions">
+              {promptMode === 'edit' && (
+                <span className="strategy-prompt-message">{message || strategyDocuments.coursePrompt.changeSummary}</span>
+              )}
+              <div className="strategy-mode-switch" role="group" aria-label="课程总 Prompt 显示模式">
+                <button className={promptMode === 'edit' ? 'is-active' : ''} type="button" onClick={() => setPromptMode('edit')}>编辑</button>
+                <button className={promptMode === 'preview' ? 'is-active' : ''} type="button" onClick={() => setPromptMode('preview')}>预览</button>
+              </div>
+              {promptMode === 'edit' && (
+                <button className="primary-button" type="button" disabled={isSaving} onClick={savePrompt}>
+                  <Check size={16} /> {isSaving ? '正在保存' : '保存'}
+                </button>
+              )}
+            </div>
+          </header>
+          {promptMode === 'edit' ? (
+            <textarea
+              className="strategy-prompt-editor"
+              value={coursePrompt}
+              onChange={(event) => setCoursePrompt(event.target.value)}
+              placeholder="在此维护课程级复习指令，保存后将用于后续 AI 行为。"
+            />
+          ) : (
+            <article className="strategy-markdown-preview">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {coursePrompt.trim() ? coursePrompt : '（暂无课程级指令）点击右上角「编辑」可维护课程级复习指令，保存后将用于后续 AI 行为。'}
+              </ReactMarkdown>
+            </article>
+          )}
         </section>
       </div>
-      {strategyDocuments.maintenanceError && <p className="setup-error">计划维护失败：{strategyDocuments.maintenanceError}</p>}
-    </div>
+      )}
+      {isExpanded && strategyDocuments.maintenanceError && <p className="setup-error">计划维护失败：{strategyDocuments.maintenanceError}</p>}
+    </section>
   )
 }
 
@@ -1117,12 +1904,12 @@ function DiagnosticResultView({
               return (
                 <article className="diagnostic-review-card" key={question.id}>
                   <span className="question-label">错题 {index + 1} · {question.source}</span>
-                  <h3>{question.prompt}</h3>
+                  <h3><FormulaText text={question.prompt} /></h3>
                   <div className="diagnostic-answer-compare">
-                    <p><CircleAlert size={15} /> 你的答案：{getDiagnosticChoiceLabel(question, selectedAnswer)}</p>
-                    <p><CheckCircle2 size={15} /> 正确答案：{String.fromCharCode(65 + question.answerIndex)}. {getDiagnosticChoiceLabel(question, question.answerIndex)}</p>
+                    <p><CircleAlert size={15} /> 你的答案：<FormulaText text={getDiagnosticChoiceLabel(question, selectedAnswer)} /></p>
+                    <p><CheckCircle2 size={15} /> 正确答案：{String.fromCharCode(65 + question.answerIndex)}. <FormulaText text={getDiagnosticChoiceLabel(question, question.answerIndex)} /></p>
                   </div>
-                  <p className="diagnostic-explanation">{question.explanation}</p>
+                  <p className="diagnostic-explanation"><FormulaText text={question.explanation} /></p>
                 </article>
               )
             })}
@@ -1219,6 +2006,318 @@ function getInitialStudyPageIndex(task: PlanTask, pageCount: number) {
 function getStudyProgressForPage(pageIndex: number, pageCount: number) {
   if (pageCount <= 0) return 0
   return Math.min(100, Math.round(((pageIndex + 1) / pageCount) * 100))
+}
+
+function trimBrackets(text: string) {
+  const trimmedText = text.trim()
+  if (
+    (trimmedText.startsWith('[') && trimmedText.endsWith(']'))
+    || (trimmedText.startsWith('(') && trimmedText.endsWith(')'))
+  ) {
+    return trimmedText.slice(1, -1).trim()
+  }
+  return trimmedText
+}
+
+function isUnitSlash(numerator: string, denominator: string) {
+  const unitNumerators = ['m', 'km', 'cm', 'mm', 'kg', 'N', 'J', 'W', 'V', 'A', 'C', 'rad']
+  const unitDenominators = ['s', 'h', 'min', 'm', 'kg']
+  return unitNumerators.includes(numerator.trim()) && unitDenominators.includes(denominator.trim())
+}
+
+const bareLatexCommandPattern = /\\[A-Za-z]+/
+const latexScriptPattern = /[_^](?:\{[^{}]+\}|-?[A-Za-z0-9]+)/
+const latexCandidateCharacterPattern = /[A-Za-z0-9\\{}_^=+\-*/×÷·.,()\[\]|<>%μωθαλφΩπεβγδσΔΣ∞ 　\t]/
+
+function renderKatexFormula(latex: string, key: string) {
+  try {
+    const normalizedLatex = latex
+      .replace(/^\\\[\s*|\s*\\\]$/g, '')
+      .replace(/^\\\(\s*|\s*\\\)$/g, '')
+    return (
+      <span
+        className="formula-katex"
+        dangerouslySetInnerHTML={{
+          __html: katex.renderToString(normalizedLatex, {
+            displayMode: false,
+            output: 'html',
+            strict: 'ignore',
+            throwOnError: true,
+            trust: false,
+          }),
+        }}
+        key={key}
+      />
+    )
+  } catch {
+    return null
+  }
+}
+
+function renderLegacyFormulaInline(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = []
+  const formulaTokenPattern = /([A-Za-z0-9μωθαλφΩπεβγδσΔΣ∞)）])([_^])(-?[A-Za-z0-9]+)|([A-Za-zμωθλφΩ])([23])(?=$|[^A-Za-z0-9])|([vV])([0-9])|([A-Za-zμωθλφΩ])([0-9])(?=$|[^A-Za-z0-9])|(^|[^A-Za-z])B([Rr])(?=$|[^A-Za-z])/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = formulaTokenPattern.exec(text))) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index))
+    }
+
+    const [
+      ,
+      base,
+      marker,
+      script,
+      powerBase,
+      implicitPower,
+      compactSubscriptBase,
+      compactNumericSubscript,
+      subscriptBase,
+      implicitNumericSubscript,
+      prefix = '',
+      implicitSubscript,
+    ] = match
+    if (implicitSubscript) {
+      if (prefix) nodes.push(prefix)
+      nodes.push(
+        <span className="formula-symbol" key={`${keyPrefix}-${match.index}-${match[0]}`}>
+          B<sub>{implicitSubscript}</sub>
+        </span>,
+      )
+    } else if (implicitPower) {
+      nodes.push(
+        <span className="formula-symbol" key={`${keyPrefix}-${match.index}-${match[0]}`}>
+          {powerBase}<sup>{implicitPower}</sup>
+        </span>,
+      )
+    } else if (compactNumericSubscript || implicitNumericSubscript) {
+      nodes.push(
+        <span className="formula-symbol" key={`${keyPrefix}-${match.index}-${match[0]}`}>
+          {compactSubscriptBase ?? subscriptBase}<sub>{compactNumericSubscript ?? implicitNumericSubscript}</sub>
+        </span>,
+      )
+    } else {
+      nodes.push(
+        <span className="formula-symbol" key={`${keyPrefix}-${match.index}-${match[0]}`}>
+          {base}{marker === '_' ? <sub>{script}</sub> : <sup>{script}</sup>}
+        </span>,
+      )
+    }
+    lastIndex = match.index + match[0].length
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex))
+  }
+
+  return nodes
+}
+
+function renderFormulaInline(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = []
+  let plainStart = 0
+  let candidateStart = -1
+  let braceDepth = 0
+
+  const flushCandidate = (end: number) => {
+    if (candidateStart < 0) return
+    const candidate = text.slice(candidateStart, end)
+    if (bareLatexCommandPattern.test(candidate) || latexScriptPattern.test(candidate)) {
+      if (candidateStart > plainStart) {
+        nodes.push(...renderLegacyFormulaInline(text.slice(plainStart, candidateStart), `${keyPrefix}-plain-${plainStart}`))
+      }
+      const leadingWhitespace = candidate.match(/^\s*/)?.[0] ?? ''
+      const trailingWhitespace = candidate.match(/\s*$/)?.[0] ?? ''
+      const latex = candidate.trim()
+      if (leadingWhitespace) nodes.push(leadingWhitespace)
+      const formula = renderKatexFormula(latex, `${keyPrefix}-latex-${candidateStart}`)
+      if (formula) {
+        nodes.push(formula)
+      } else {
+        nodes.push(...renderLegacyFormulaInline(latex, `${keyPrefix}-fallback-${candidateStart}`))
+      }
+      if (trailingWhitespace) nodes.push(trailingWhitespace)
+      plainStart = end
+    }
+    candidateStart = -1
+    braceDepth = 0
+  }
+
+  for (let index = 0; index <= text.length; index += 1) {
+    const character = text[index]
+    const isCandidateCharacter = Boolean(
+      character && (latexCandidateCharacterPattern.test(character) || (candidateStart >= 0 && braceDepth > 0)),
+    )
+    if (isCandidateCharacter && candidateStart < 0) candidateStart = index
+    if (candidateStart >= 0 && character === '{') braceDepth += 1
+    if (candidateStart >= 0 && character === '}') braceDepth = Math.max(0, braceDepth - 1)
+    if (!isCandidateCharacter) flushCandidate(index)
+  }
+
+  if (plainStart < text.length) {
+    nodes.push(...renderLegacyFormulaInline(text.slice(plainStart), `${keyPrefix}-plain-${plainStart}`))
+  }
+  return nodes
+}
+
+function renderUnwrappedFormulaText(text: string, depth = 0): ReactNode[] {
+  const normalizedText = text.replace(/\*\*/g, '')
+  const nodes: ReactNode[] = []
+  const fractionAtom = String.raw`[A-Za-zμωθαλφΩπεβγδσΔΣ∞\d.'′·×⁰-⁹₀-₉]+(?:\^(?:-?[A-Za-z0-9]+|\{[^{}]+\}))?`
+  const fractionOperand = String.raw`(?:\[[^\[\]]+\]|\([^()]+\)(?:\^(?:-?[A-Za-z0-9]+|\{[^{}]+\}))?|${fractionAtom})`
+  const fractionPattern = new RegExp(String.raw`\((${fractionAtom})\s*\/\s*(${fractionAtom})\)|(${fractionOperand})\s*\/\s*(${fractionOperand})`, 'g')
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = fractionPattern.exec(normalizedText))) {
+    if (match.index > lastIndex) {
+      nodes.push(...renderFormulaInline(normalizedText.slice(lastIndex, match.index), `plain-${lastIndex}`))
+    }
+
+    const numerator = match[1] ?? match[3]
+    const denominator = match[2] ?? match[4]
+    const fractionClassName = `formula-fraction${depth > 0 ? ' is-nested' : ''}${/[\/\[\]()]/.test(`${numerator}${denominator}`) ? ' is-compound' : ''}`
+    if (match[3] && match[4] && isUnitSlash(numerator, denominator)) {
+      nodes.push(...renderFormulaInline(match[0], `unit-${match.index}`))
+      lastIndex = match.index + match[0].length
+      continue
+    }
+
+    const fraction = (
+      <span className={fractionClassName} key={`fraction-${match.index}-${match[0]}`}>
+        <span className="formula-fraction-numerator">{renderFormulaText(trimBrackets(numerator), depth + 1)}</span>
+        <span className="formula-fraction-denominator">{renderFormulaText(trimBrackets(denominator), depth + 1)}</span>
+      </span>
+    )
+    const fractionEnd = match.index + match[0].length
+    const exponentMatch = normalizedText.slice(fractionEnd).match(/^\^(?:\{([^{}]+)\}|(-?[A-Za-z0-9]+))/)
+    if (exponentMatch) {
+      nodes.push(
+        <span className="formula-symbol" key={`fraction-power-${match.index}-${match[0]}`}>
+          {fraction}<sup>{exponentMatch[1] ?? exponentMatch[2]}</sup>
+        </span>,
+      )
+      lastIndex = fractionEnd + exponentMatch[0].length
+    } else {
+      nodes.push(fraction)
+      lastIndex = fractionEnd
+    }
+  }
+
+  if (lastIndex < normalizedText.length) {
+    nodes.push(...renderFormulaInline(normalizedText.slice(lastIndex), `plain-${lastIndex}`))
+  }
+
+  return nodes
+}
+
+function renderFormulaText(text: string, depth = 0): ReactNode[] {
+  const nodes: ReactNode[] = []
+  const explicitFormulaPattern = /\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = explicitFormulaPattern.exec(text))) {
+    if (match.index > lastIndex) {
+      nodes.push(...renderUnwrappedFormulaText(text.slice(lastIndex, match.index), depth))
+    }
+    const latex = match[1] ?? match[2] ?? ''
+    const formula = renderKatexFormula(latex, `explicit-${depth}-${match.index}`)
+    if (formula) {
+      nodes.push(formula)
+    } else {
+      nodes.push(...renderUnwrappedFormulaText(match[0], depth))
+    }
+    lastIndex = match.index + match[0].length
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(...renderUnwrappedFormulaText(text.slice(lastIndex), depth))
+  }
+  return nodes
+}
+
+function FormulaText({ text }: { text: string }) {
+  return <>{renderFormulaText(text)}</>
+}
+
+function stripStudySourceMarkers(text: string) {
+  return text
+    .replace(/\[来源[:：][^\]]+\]/g, '')
+    .replace(/[（(]来源[:：][^）)]+[）)]/g, '')
+    .replace(/先回到[^，。]+[，,]\s*/g, '先')
+    .replace(/优先查看[^，。]+[，,。]\s*/g, '')
+    .replace(/关联知识点来源[^，。]+[，,。]\s*/g, '')
+    .replace(/目标量和资料出处/g, '目标量')
+    .replace(/、?资料出处/g, '')
+    .replace(/、?出处来源/g, '')
+    .replace(/和。/g, '。')
+    .replace(/([，、])。/g, '。')
+    .replace(/、、/g, '、')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function StudyFormulaText({ text }: { text: string }) {
+  return <FormulaText text={stripStudySourceMarkers(text)} />
+}
+
+function studyConceptTitle(title: string) {
+  return /资料定位|来源|出处|资料依据|参考/.test(title) ? '学习切入' : stripStudySourceMarkers(title)
+}
+
+function isChoiceMarkerAt(text: string, index: number) {
+  const label = text[index]
+  const marker = text[index + 1]
+  if (!label || !/[A-D]/.test(label) || !marker || !'.．、'.includes(marker)) return false
+  const previous = text[index - 1]
+  return index === 0 || /\s/.test(previous) || '：:；;，,。'.includes(previous)
+}
+
+function parseChoiceQuestion(text: string) {
+  const markers: Array<{ label: string; labelStart: number; contentStart: number }> = []
+  for (let index = 0; index < text.length - 1; index += 1) {
+    if (!isChoiceMarkerAt(text, index)) continue
+    let contentStart = index + 2
+    while (/\s/.test(text[contentStart] ?? '')) contentStart += 1
+    markers.push({ label: text[index], labelStart: index, contentStart })
+  }
+  if (markers.length < 2) return null
+
+  return {
+    prompt: text.slice(0, markers[0].labelStart).trim(),
+    choices: markers.map((marker, index) => {
+      const nextMarker = markers[index + 1]
+      const contentEnd = nextMarker?.labelStart ?? text.length
+      return {
+        label: marker.label,
+        text: text.slice(marker.contentStart, contentEnd).replace(/[；;，,。]\s*$/, '').trim(),
+      }
+    }),
+  }
+}
+
+function WorkedExampleQuestion({ text }: { text: string }) {
+  const choiceQuestion = parseChoiceQuestion(text)
+  if (!choiceQuestion) {
+    return <p className="worked-example-question-text"><FormulaText text={text} /></p>
+  }
+
+  return (
+    <section className="worked-example-question">
+      {choiceQuestion.prompt && <p><FormulaText text={choiceQuestion.prompt} /></p>}
+      <div className="worked-choice-list">
+        {choiceQuestion.choices.map((choice) => (
+          <div className="worked-choice-option" key={choice.label}>
+            <span>{choice.label}</span>
+            <p><FormulaText text={choice.text} /></p>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
 }
 
 function buildStudyGuide(task: PlanTask, knowledgePoint: KnowledgePoint | undefined, courseName: string): StudyGuide {
@@ -1640,15 +2739,15 @@ function buildStudyGuide(task: PlanTask, knowledgePoint: KnowledgePoint | undefi
       return {
         objectives: [
           `能复述「${task.title}」的核心概念和适用条件。`,
-          '能把资料中的公式或结论转成自己的解题步骤。',
+          '能把本节公式或结论转成自己的解题步骤。',
           '能完成至少一道对应练习题，检查是否真正掌握。',
         ],
         sourceHighlights: [
-          `优先查看：${task.source}。`,
-          knowledgePoint?.source ? `关联知识点来源：${knowledgePoint.source}。` : '优先从复习总览定位定义、公式、判别规则和例题。',
+          '先抓定义、公式、判别规则和例题结构。',
+          '再用一道题验证自己能否独立完成判断、代入和复述。',
         ],
         concepts: [
-          { title: '资料定位', body: `优先查看：${task.source}。学习时先找定义、公式、判别规则和例题。` },
+          { title: '学习切入', body: '先找本节的定义、公式、判别规则和例题结构，再把它们整理成可复述的解题路径。' },
           { title: '核心讲解', body: knowledgePoint?.summary ?? task.description },
           { title: '检验方法', body: '学完后不要只看“懂了”，要用一道题验证自己能否独立判断条件、选公式、写步骤。' },
         ],
@@ -1676,7 +2775,9 @@ function StudyTaskView({
   task,
   knowledgePoint,
   practiceQuestions,
+  practiceAnswers,
   onSubmitPractice,
+  onClearPracticeAnswer,
   onBack,
   onPractice,
   onProgressChange,
@@ -1685,7 +2786,9 @@ function StudyTaskView({
   task: PlanTask
   knowledgePoint?: KnowledgePoint
   practiceQuestions: QuizQuestion[]
+  practiceAnswers?: Record<string, PracticeAnswerRecord>
   onSubmitPractice: ModuleViewProps['onSubmitPractice']
+  onClearPracticeAnswer?: ModuleViewProps['onClearPracticeAnswer']
   onBack: () => void
   onPractice: () => void
   onProgressChange: (pageIndex: number, pageCount: number) => void
@@ -1696,8 +2799,28 @@ function StudyTaskView({
     mastery: number
     generatedSimilarCount: number
   }
-  const [selectedPracticeAnswers, setSelectedPracticeAnswers] = useState<Record<string, number>>({})
-  const [practiceFeedbackById, setPracticeFeedbackById] = useState<Record<string, StudyPracticeFeedback>>({})
+  function restorePracticeState(records?: Record<string, PracticeAnswerRecord>) {
+    const answers: Record<string, number> = {}
+    const feedback: Record<string, StudyPracticeFeedback> = {}
+    if (records) {
+      for (const [id, record] of Object.entries(records)) {
+        answers[id] = record.answerIndex
+        feedback[id] = {
+          correct: record.correct,
+          explanation: record.explanation,
+          mastery: record.mastery,
+          generatedSimilarCount: 0,
+        }
+      }
+    }
+    return { answers, feedback }
+  }
+  const [selectedPracticeAnswers, setSelectedPracticeAnswers] = useState<Record<string, number>>(
+    () => restorePracticeState(practiceAnswers).answers,
+  )
+  const [practiceFeedbackById, setPracticeFeedbackById] = useState<Record<string, StudyPracticeFeedback>>(
+    () => restorePracticeState(practiceAnswers).feedback,
+  )
   const [submittingPracticeId, setSubmittingPracticeId] = useState<string | null>(null)
   const [studyPageIndex, setStudyPageIndex] = useState(0)
   const isCompleted = task.status === 'completed'
@@ -1718,9 +2841,16 @@ function StudyTaskView({
         : []
   const relatedPracticeQuestions = getRelatedPracticeQuestions(task, knowledgePoint, guide, practiceQuestions)
 
-  async function submitStudyPracticeAnswer(question: QuizQuestion, answerIndex: number) {
+  // 自测题：先选择、后提交——点选项只标记「预选」，必须再点「提交答案」才算正式作答。
+  function selectPracticeAnswer(question: QuizQuestion, answerIndex: number) {
     if (submittingPracticeId || practiceFeedbackById[question.id]) return
     setSelectedPracticeAnswers((current) => ({ ...current, [question.id]: answerIndex }))
+  }
+
+  async function confirmPracticeAnswer(question: QuizQuestion) {
+    if (submittingPracticeId || practiceFeedbackById[question.id]) return
+    const answerIndex = selectedPracticeAnswers[question.id]
+    if (answerIndex === undefined) return
     setSubmittingPracticeId(question.id)
     try {
       const result = await onSubmitPractice(question.id, answerIndex, '主线学习')
@@ -1744,13 +2874,10 @@ function StudyTaskView({
               <article className="study-exam-point" key={point.id}>
                 <header>
                   <span>{String(index + 1).padStart(2, '0')}</span>
-                  <strong>{point.title}</strong>
+                  <strong><StudyFormulaText text={point.title} /></strong>
                   <em>{point.importance === 'high' ? '高频重点' : point.importance === 'medium' ? '常规考点' : '快速验证'}</em>
                 </header>
-                {point.questionTypes?.length ? <p>常见考法：{point.questionTypes.join('、')}</p> : null}
-                <ul className="study-source-list">
-                  {point.sourceRefs.map((source) => <li key={source}>{source}</li>)}
-                </ul>
+                {point.questionTypes?.length ? <p><StudyFormulaText text={`常见考法：${point.questionTypes.join('、')}`} /></p> : null}
               </article>
             ))}
           </div>
@@ -1760,15 +2887,7 @@ function StudyTaskView({
               <span className="study-subhead">学习目标</span>
               <ul className="study-points">
                 {(focusSection?.objectives ?? guide.objectives ?? []).map((objective) => (
-                  <li key={objective}><Target size={16} /> {objective}</li>
-                ))}
-              </ul>
-            </section>
-            <section>
-              <span className="study-subhead">资料依据</span>
-              <ul className="study-source-list">
-                {(focusSection?.sourceHighlights ?? guide.sourceHighlights ?? []).map((item) => (
-                  <li key={item}>{item}</li>
+                    <li key={objective}><Target size={16} /> <StudyFormulaText text={objective} /></li>
                 ))}
               </ul>
             </section>
@@ -1784,33 +2903,32 @@ function StudyTaskView({
           {methodExamPoints.length
             ? methodExamPoints.map((point) => (
                 <article className="study-concept" key={point.id}>
-                  <strong>{point.title}</strong>
-                  <p>{point.explanation}</p>
+                  <strong><StudyFormulaText text={point.title} /></strong>
+                  <p><StudyFormulaText text={point.explanation} /></p>
                   {point.formulas?.map((formula) => (
                     <div className="study-formula" key={`${point.id}-${formula.expression}`}>
-                      <code>{formula.expression}</code>
-                      <p>{formula.meaning}</p>
-                      <span>适用条件：{formula.conditions}</span>
+                      <code><StudyFormulaText text={formula.expression} /></code>
+                      <p><StudyFormulaText text={formula.meaning} /></p>
+                      <span><StudyFormulaText text={`适用条件：${formula.conditions}`} /></span>
                     </div>
                   ))}
                   {point.procedure?.length ? (
                     <ol className="study-procedure">
-                      {point.procedure.map((step) => <li key={step}>{step}</li>)}
+                      {point.procedure.map((step) => <li key={step}><StudyFormulaText text={step} /></li>)}
                     </ol>
                   ) : null}
                   {point.pitfalls?.length ? (
                     <ul className="study-pitfalls">
-                      {point.pitfalls.map((pitfall) => <li key={pitfall}>{pitfall}</li>)}
+                      {point.pitfalls.map((pitfall) => <li key={pitfall}><StudyFormulaText text={pitfall} /></li>)}
                     </ul>
                   ) : null}
                 </article>
               ))
             : (methodSection?.concepts ?? guide.concepts ?? []).map((concept) => (
                 <article className="study-concept" key={concept.title}>
-                  <strong>{concept.title}</strong>
-                  <p>{concept.body}</p>
-                  {concept.formula && <code>{concept.formula}</code>}
-                  {concept.source && <span>{concept.source}</span>}
+                  <strong><FormulaText text={studyConceptTitle(concept.title)} /></strong>
+                  <p><StudyFormulaText text={concept.body} /></p>
+                  {concept.formula && <code><StudyFormulaText text={concept.formula} /></code>}
                 </article>
               ))}
         </div>
@@ -1826,19 +2944,22 @@ function StudyTaskView({
               <header>
                 <div>
                   <span>例题 {index + 1}</span>
-                  <h3>{example.title}</h3>
+                  <h3><StudyFormulaText text={example.title} /></h3>
                 </div>
-                {example.source && <em>{example.origin === 'ai-adapted' ? 'AI 仿题' : '资料例题'} · {example.source}</em>}
               </header>
-              <p>{example.problem ?? example.setup}</p>
-              {example.analysis && <p className="worked-example-analysis"><strong>题型分析：</strong>{example.analysis}</p>}
+              <WorkedExampleQuestion text={stripStudySourceMarkers(example.problem ?? example.setup ?? '')} />
+              {example.analysis && (
+                <p className="worked-example-analysis">
+                  <strong>题型分析：</strong><StudyFormulaText text={example.analysis} />
+                </p>
+              )}
               <ol>
-                {example.steps.map((step) => <li key={step}>{step}</li>)}
+                {example.steps.map((step) => <li key={step}><StudyFormulaText text={step} /></li>)}
               </ol>
-              <strong>{example.answer ?? example.conclusion}</strong>
+              <strong className="worked-example-answer"><StudyFormulaText text={example.answer ?? example.conclusion ?? ''} /></strong>
               {example.checks?.length ? (
                 <ul className="study-checklist">
-                  {example.checks.map((check) => <li key={check}><CheckCircle2 size={15} /> {check}</li>)}
+                  {example.checks.map((check) => <li key={check}><CheckCircle2 size={15} /> <StudyFormulaText text={check} /></li>)}
                 </ul>
               ) : null}
             </article>
@@ -1855,7 +2976,7 @@ function StudyTaskView({
           {(selfCheckSection?.checklist ?? guide.checklist ?? []).length ? (
             <ul className="study-checklist">
               {(selfCheckSection?.checklist ?? guide.checklist ?? []).map((item) => (
-                <li key={item}><CheckCircle2 size={15} /> {item}</li>
+                <li key={item}><CheckCircle2 size={15} /> <StudyFormulaText text={item} /></li>
               ))}
             </ul>
           ) : null}
@@ -1866,8 +2987,8 @@ function StudyTaskView({
               const isSubmitting = submittingPracticeId === question.id
               return (
                 <article className="study-practice-card" key={question.id}>
-                  <span className="question-label">自测 {questionIndex + 1} · {question.source}</span>
-                  <p>{question.prompt}</p>
+                  <span className="question-label">自测 {questionIndex + 1}</span>
+                  <p><StudyFormulaText text={question.prompt} /></p>
                   <div className="choice-list">
                     {[...question.options, UNKNOWN_CHOICE_LABEL].map((choice, index) => {
                       const choiceId = String.fromCharCode(65 + index)
@@ -1886,16 +3007,28 @@ function StudyTaskView({
                           key={`${question.id}-${choiceId}`}
                           type="button"
                           disabled={hasAnswered || Boolean(submittingPracticeId)}
-                          onClick={() => void submitStudyPracticeAnswer(question, index)}
+                          onClick={() => selectPracticeAnswer(question, index)}
                         >
                           <b>{choiceId}</b>
-                          <span>{choice}</span>
+                          <span><StudyFormulaText text={choice} /></span>
                           {hasAnswered && question.answerIndex === index && <CheckCircle2 size={19} />}
                           {hasAnswered && selectedAnswer === index && question.answerIndex !== index && <CircleAlert size={19} />}
                         </button>
                       )
                     })}
                   </div>
+                  {!practiceFeedback && selectedAnswer !== undefined && (
+                    <div className="study-practice-confirm">
+                      <button
+                        className="primary-button"
+                        type="button"
+                        disabled={Boolean(submittingPracticeId)}
+                        onClick={() => void confirmPracticeAnswer(question)}
+                      >
+                        {isSubmitting ? 'AI 分析中' : '提交答案'} <Check size={16} />
+                      </button>
+                    </div>
+                  )}
                   {isSubmitting && (
                     <section className="answer-feedback">
                       <div><Sparkles size={21} /><strong>AI 正在分析这道题，并准备同类练习。</strong></div>
@@ -1911,8 +3044,9 @@ function StudyTaskView({
                             : `已加入错题本${practiceFeedback.generatedSimilarCount ? `，新增 ${practiceFeedback.generatedSimilarCount} 道同类练习` : ''}。`}
                         </strong>
                       </div>
-                      <p>{practiceFeedback.explanation}</p>
+                      <p><StudyFormulaText text={practiceFeedback.explanation} /></p>
                       <button type="button" onClick={() => {
+                        if (onClearPracticeAnswer) void onClearPracticeAnswer(question.id)
                         setSelectedPracticeAnswers((current) => {
                           const next = { ...current }
                           delete next[question.id]
@@ -1939,8 +3073,9 @@ function StudyTaskView({
   ]
 
   useEffect(() => {
-    setSelectedPracticeAnswers({})
-    setPracticeFeedbackById({})
+    const restored = restorePracticeState(practiceAnswers)
+    setSelectedPracticeAnswers(restored.answers)
+    setPracticeFeedbackById(restored.feedback)
     setSubmittingPracticeId(null)
     const initialPageIndex = getInitialStudyPageIndex(task, studyPages.length)
     setStudyPageIndex(initialPageIndex)
@@ -1979,7 +3114,6 @@ function StudyTaskView({
         <header>
           <div>
             <span className="question-label">复习主线 · 速成讲解 · 预计 {task.duration} 分钟</span>
-            <span className="question-source">来源：{task.source}</span>
           </div>
           <span className="question-counter">当前进度 {displayProgress}%</span>
         </header>
@@ -2060,33 +3194,156 @@ function StudyTaskView({
   )
 }
 
+function buildPracticeFeedback(record: PracticeAnswerRecord | undefined) {
+  if (!record) return null
+  return {
+    correct: record.correct,
+    explanation: record.explanation,
+    mastery: record.mastery,
+    generatedSimilarCount: 0,
+  }
+}
+
+type PracticeChapterGroup = {
+  key: string
+  name: string
+  questions: QuizQuestion[]
+}
+
+// 按知识点（章节）对练习题分组：沿用 knowledgePoints 的顺序，组内保持原顺序（稳定），
+// 没有匹配知识点的题目归入「其他知识点」。practiceQuestions 后端无按薄弱度/权重的有意排序，
+// 因此按章节重排不会破坏教学顺序，反而让答错后追加的同类题自动归入对应章节。
+function buildPracticeChapterGroups(
+  questions: QuizQuestion[],
+  knowledgePoints: KnowledgePoint[],
+): PracticeChapterGroup[] {
+  const order = new Map(knowledgePoints.map((point, index) => [point.id, index]))
+  const known = new Map<number, PracticeChapterGroup>()
+  const others: QuizQuestion[] = []
+  for (const question of questions) {
+    const groupIndex = order.get(question.knowledgePointId)
+    if (groupIndex === undefined) {
+      others.push(question)
+      continue
+    }
+    let group = known.get(groupIndex)
+    if (!group) {
+      const knowledgePoint = knowledgePoints[groupIndex]
+      group = { key: knowledgePoint.id, name: knowledgePoint.name, questions: [] }
+      known.set(groupIndex, group)
+    }
+    group.questions.push(question)
+  }
+  const groups = Array.from(known.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([, group]) => group)
+  if (others.length) {
+    groups.push({ key: '__other__', name: '其他知识点', questions: others })
+  }
+  return groups
+}
+
+function practicePositionStorageKey(courseId: string) {
+  return `final-congee-practice-position:${courseId}`
+}
+
+// 读取上次答到的题目 id（按 questionId 恢复，比存 index 稳健：题目重生成/追加后 index 会漂移）。
+// 返回的 id 一定存在于当前 questions 中，否则返回 null 由调用方回退到第一题。
+function readPracticePositionId(questions: QuizQuestion[], courseId: string): string | null {
+  if (!questions.length) return null
+  try {
+    const savedId = window.localStorage.getItem(practicePositionStorageKey(courseId))
+    if (savedId && questions.some((question) => question.id === savedId)) return savedId
+  } catch {
+    /* localStorage 不可用时静默回退 */
+  }
+  return null
+}
+
 function PracticeView({
   course,
   knowledgePoints,
   practiceQuestions,
+  practiceAnswers,
   onModuleChange,
   onSubmitPractice,
+  onClearPracticeAnswer,
 }: Pick<
   ModuleViewProps,
   | 'course'
   | 'knowledgePoints'
   | 'practiceQuestions'
+  | 'practiceAnswers'
   | 'onModuleChange'
   | 'onSubmitPractice'
+  | 'onClearPracticeAnswer'
 >) {
-  const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null)
-  const [submitted, setSubmitted] = useState(false)
-  const [questionIndex, setQuestionIndex] = useState(0)
+  const chapterGroups = useMemo(
+    () => buildPracticeChapterGroups(practiceQuestions, knowledgePoints),
+    [practiceQuestions, knowledgePoints],
+  )
+  const orderedQuestions = useMemo(
+    () => chapterGroups.flatMap((group) => group.questions),
+    [chapterGroups],
+  )
+  const questionGlobalIndex = useMemo(() => {
+    const map = new Map<string, number>()
+    orderedQuestions.forEach((question, index) => map.set(question.id, index))
+    return map
+  }, [orderedQuestions])
+
+  // 以 questionId 作为位置真相：答错后后端会追加同类题使 orderedQuestions 重排，
+  // 用 id 派生 index 可保证列表变化时仍稳定指向同一道题，不会突然跳题。
+  const [currentId, setCurrentId] = useState<string | null>(() => {
+    const savedId = readPracticePositionId(orderedQuestions, course.id)
+    return savedId ?? orderedQuestions[0]?.id ?? null
+  })
+  const questionIndex = useMemo(() => {
+    if (!orderedQuestions.length || !currentId) return 0
+    const index = orderedQuestions.findIndex((question) => question.id === currentId)
+    return index >= 0 ? index : 0
+  }, [orderedQuestions, currentId])
+  useEffect(() => {
+    if (!currentId) return
+    try {
+      window.localStorage.setItem(practicePositionStorageKey(course.id), currentId)
+    } catch {
+      /* 忽略写入失败（如隐私模式） */
+    }
+  }, [currentId, course.id])
+  // currentId 缺失（初次进入时题目仍在生成）或当前题已不在列表中（题目被重生成）时，
+  // 尝试从 localStorage 恢复上次位置，否则回到第一题。保证位置记忆在题目到达后仍生效。
+  useEffect(() => {
+    if (!orderedQuestions.length) return
+    if (currentId && orderedQuestions.some((question) => question.id === currentId)) return
+    const restored = readPracticePositionId(orderedQuestions, course.id)
+    setCurrentId(restored ?? orderedQuestions[0].id)
+  }, [orderedQuestions, currentId, course.id])
+
+  const initialQuestion = orderedQuestions[questionIndex]
+  const firstRecord = practiceAnswers?.[initialQuestion?.id]
+  const [selectedAnswer, setSelectedAnswer] = useState<string | null>(
+    firstRecord ? String(firstRecord.answerIndex) : null,
+  )
+  const [submitted, setSubmitted] = useState(Boolean(firstRecord))
   const [feedback, setFeedback] = useState<{
     correct: boolean
     explanation: string
     mastery: number
     generatedSimilarCount: number
-  } | null>(null)
+  } | null>(buildPracticeFeedback(firstRecord))
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const question = practiceQuestions[questionIndex]
+  const [showNav, setShowNav] = useState(false)
+  const question = orderedQuestions[questionIndex]
   const selectedIndex = selectedAnswer ? Number(selectedAnswer) : -1
   const knowledgePoint = knowledgePoints.find((point) => point.id === question?.knowledgePointId)
+
+  function restoreQuestion(id: string) {
+    const record = practiceAnswers?.[id]
+    setSelectedAnswer(record ? String(record.answerIndex) : null)
+    setSubmitted(Boolean(record))
+    setFeedback(buildPracticeFeedback(record))
+  }
 
   async function submitAnswer() {
     if (!question || selectedIndex < 0) return
@@ -2100,11 +3357,34 @@ function PracticeView({
     }
   }
 
-  function nextQuestion() {
+  function goPrev() {
+    const prev = orderedQuestions[questionIndex - 1]
+    if (!prev) return
+    setCurrentId(prev.id)
+    restoreQuestion(prev.id)
+  }
+
+  function goNext() {
+    const next = orderedQuestions[questionIndex + 1]
+    if (!next) return
+    setCurrentId(next.id)
+    restoreQuestion(next.id)
+  }
+
+  function jumpTo(index: number) {
+    const target = orderedQuestions[index]
+    if (!target) return
+    setCurrentId(target.id)
+    restoreQuestion(target.id)
+    setShowNav(false)
+  }
+
+  async function redoQuestion() {
+    if (!question || !onClearPracticeAnswer) return
+    await onClearPracticeAnswer(question.id)
     setSelectedAnswer(null)
     setSubmitted(false)
     setFeedback(null)
-    setQuestionIndex((current) => (current + 1) % Math.max(practiceQuestions.length, 1))
   }
 
   if (!question) {
@@ -2119,9 +3399,14 @@ function PracticeView({
           <h1>刷题练习</h1>
           <p>这一组题围绕你的薄弱点生成。答题结果会写回掌握度和复习计划。</p>
         </div>
-        <div className="practice-score">
-          <span>本轮进度</span>
-          <strong>{questionIndex + 1} <small>/ {practiceQuestions.length}</small></strong>
+        <div className="practice-heading-actions">
+          <button type="button" className="secondary-button practice-nav-trigger" onClick={() => setShowNav(true)}>
+            <ListChecks size={16} /> 题目导航
+          </button>
+          <div className="practice-score">
+            <span>本轮进度</span>
+            <strong>{questionIndex + 1} <small>/ {orderedQuestions.length}</small></strong>
+          </div>
         </div>
       </section>
 
@@ -2129,11 +3414,12 @@ function PracticeView({
         <header>
           <div>
             <span className="question-label">单选题 · {question.score} 分</span>
+            {knowledgePoint && <span className="question-chapter">{knowledgePoint.name}</span>}
             <span className="question-source">参考：{question.source}</span>
           </div>
-          <span className="question-counter">{String(questionIndex + 1).padStart(2, '0')} / {String(practiceQuestions.length).padStart(2, '0')}</span>
+          <span className="question-counter">{String(questionIndex + 1).padStart(2, '0')} / {String(orderedQuestions.length).padStart(2, '0')}</span>
         </header>
-        <h2>{question.prompt}</h2>
+        <h2><FormulaText text={question.prompt} /></h2>
         <div className="choice-list">
           {[...question.options, UNKNOWN_CHOICE_LABEL].map((choice, index) => {
             const choiceId = String.fromCharCode(65 + index)
@@ -2155,7 +3441,7 @@ function PracticeView({
                 onClick={() => setSelectedAnswer(String(index))}
               >
                 <b>{choiceId}</b>
-                <span>{choice}</span>
+                <span><FormulaText text={choice} /></span>
                 {submitted && isChoiceCorrect && <CheckCircle2 size={19} />}
                 {submitted && !isChoiceCorrect && selectedIndex === index && <CircleAlert size={19} />}
               </button>
@@ -2173,7 +3459,7 @@ function PracticeView({
                   : `AI 已解析错因并加入错题本${feedback.generatedSimilarCount ? `，新增 ${feedback.generatedSimilarCount} 道同类练习` : ''}。`}
               </strong>
             </div>
-            <p>{feedback.explanation}</p>
+            <p><FormulaText text={feedback.explanation} /></p>
             <button type="button" onClick={() => onModuleChange('errors')}>查看相关错题 <ArrowRight size={15} /></button>
           </section>
         )}
@@ -2191,13 +3477,28 @@ function PracticeView({
             返回主线
           </button>
           {submitted ? (
-            <button className="primary-button" type="button" onClick={nextQuestion}>
-              下一题 <ArrowRight size={16} />
-            </button>
+            <>
+              {onClearPracticeAnswer && (
+                <button className="secondary-button" type="button" onClick={() => void redoQuestion()}>
+                  重做本题 <RotateCcw size={15} />
+                </button>
+              )}
+              <button className="secondary-button" type="button" disabled={questionIndex <= 0} onClick={goPrev}>
+                <ChevronLeft size={16} /> 上一题
+              </button>
+              <button className="primary-button" type="button" disabled={questionIndex >= orderedQuestions.length - 1} onClick={goNext}>
+                下一题 <ArrowRight size={16} />
+              </button>
+            </>
           ) : (
-            <button className="primary-button" type="button" disabled={!selectedAnswer || isSubmitting} onClick={submitAnswer}>
-              {isSubmitting ? 'AI 分析中' : '提交答案'} <Check size={16} />
-            </button>
+            <>
+              <button className="secondary-button" type="button" disabled={questionIndex <= 0} onClick={goPrev}>
+                <ChevronLeft size={16} /> 上一题
+              </button>
+              <button className="primary-button" type="button" disabled={!selectedAnswer || isSubmitting} onClick={submitAnswer}>
+                {isSubmitting ? 'AI 分析中' : '提交答案'} <Check size={16} />
+              </button>
+            </>
           )}
         </footer>
       </section>
@@ -2220,42 +3521,242 @@ function PracticeView({
           <button type="button" onClick={() => onModuleChange('notes')}>记到笔记</button>
         </article>
       </section>
+
+      {showNav && (
+        <div className="practice-nav-backdrop" onClick={() => setShowNav(false)}>
+          <div className="practice-nav-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true">
+            <header className="practice-nav-header">
+              <div>
+                <h2>题目导航</h2>
+                <p>按章节分组，点击题号快速跳转。</p>
+              </div>
+              <button type="button" className="practice-nav-close" aria-label="关闭" onClick={() => setShowNav(false)}>
+                <X size={18} />
+              </button>
+            </header>
+            <div className="practice-nav-legend">
+              <span><CheckCircle2 size={15} /> 正确</span>
+              <span><XCircle size={15} /> 错误</span>
+              <span><Circle size={15} /> 未答</span>
+            </div>
+            <div className="practice-nav-body">
+              {chapterGroups.map((group) => {
+                let correct = 0
+                let wrong = 0
+                let unanswered = 0
+                for (const item of group.questions) {
+                  const record = practiceAnswers?.[item.id]
+                  if (!record) unanswered += 1
+                  else if (record.correct) correct += 1
+                  else wrong += 1
+                }
+                return (
+                  <section className="practice-nav-group" key={group.key}>
+                    <div className="practice-nav-group-title">
+                      <span className="practice-nav-group-name">{group.name}</span>
+                      <span className="practice-nav-group-meta">
+                        {group.questions.length} 题 · {correct} 正确 · {wrong} 错误 · {unanswered} 未答
+                      </span>
+                    </div>
+                    <div className="practice-nav-grid">
+                      {group.questions.map((item) => {
+                        const record = practiceAnswers?.[item.id]
+                        const status = record ? (record.correct ? 'is-correct' : 'is-wrong') : 'is-unanswered'
+                        const isCurrent = item.id === question?.id
+                        const num = (questionGlobalIndex.get(item.id) ?? 0) + 1
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className={`practice-nav-cell ${status} ${isCurrent ? 'is-current' : ''}`}
+                            onClick={() => jumpTo(questionGlobalIndex.get(item.id) ?? 0)}
+                          >
+                            <span className="practice-nav-cell-num">{num}</span>
+                            {status === 'is-correct' && <CheckCircle2 size={13} />}
+                            {status === 'is-wrong' && <XCircle size={13} />}
+                            {status === 'is-unanswered' && <Circle size={13} />}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </section>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
+}
+
+function normalizeMockQuestionType(question: QuizQuestion) {
+  return question.questionType?.trim() || '模拟题'
+}
+
+function isWrittenMockQuestion(question: QuizQuestion) {
+  const questionType = normalizeMockQuestionType(question)
+  return question.type === 'calculation' || /计算|综合|填空|简答|论述|证明/.test(questionType)
+}
+
+function summarizeMockBlueprint(questions: QuizQuestion[]) {
+  const stats = new Map<string, { count: number; score: number }>()
+  for (const question of questions) {
+    const type = normalizeMockQuestionType(question)
+    const current = stats.get(type) ?? { count: 0, score: 0 }
+    current.count += 1
+    current.score += question.score
+    stats.set(type, current)
+  }
+  return Array.from(stats.entries())
+    .map(([type, stat]) => `${type}${stat.score}分/${stat.count}题`)
+    .join('，')
+}
+
+// === 模拟卷作答草稿：localStorage 自动持久化 ===
+// 模拟卷在交卷前不落库，作答只存在于组件 state；这里把未交卷的进度也写进 localStorage，
+// 保证刷新 / 关闭浏览器 / 没点"保存并退出"都不丢，重新打开继续作答。约定与练习模块的位置记忆一致。
+function mockDraftStorageKey(courseId: string) {
+  return `final-congee-mock-draft:${courseId}`
+}
+
+type MockDraft = { answers: Record<string, MockAnswer>; currentQuestionId: string | null }
+
+// 读取并清洗草稿：只保留数字选项作答和非空文字作答，丢弃空字符串等无效项。
+function readMockDraft(courseId: string): MockDraft | null {
+  try {
+    const raw = window.localStorage.getItem(mockDraftStorageKey(courseId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<MockDraft> | null
+    if (!parsed || typeof parsed !== 'object' || !parsed.answers) return null
+    const answers: Record<string, MockAnswer> = {}
+    for (const [id, value] of Object.entries(parsed.answers)) {
+      if (typeof value === 'number') answers[id] = value
+      else if (typeof value === 'string' && value.trim().length > 0) answers[id] = value
+    }
+    const currentQuestionId = typeof parsed.currentQuestionId === 'string' ? parsed.currentQuestionId : null
+    return { answers, currentQuestionId }
+  } catch {
+    return null
+  }
+}
+
+function writeMockDraft(courseId: string, draft: MockDraft | null) {
+  try {
+    if (!draft) window.localStorage.removeItem(mockDraftStorageKey(courseId))
+    else window.localStorage.setItem(mockDraftStorageKey(courseId), JSON.stringify(draft))
+  } catch {
+    /* 隐私模式 / 存储满等不可写情况：静默回退，草稿不持久但不影响答题 */
+  }
 }
 
 function MockView({
   course,
   mockQuestions,
+  mockResult,
   onModuleChange,
   onSubmitMock,
-}: Pick<ModuleViewProps, 'course' | 'mockQuestions' | 'onModuleChange' | 'onSubmitMock'>) {
-  const [isExamStarted, setIsExamStarted] = useState(false)
-  const [questionIndex, setQuestionIndex] = useState(0)
-  const [answers, setAnswers] = useState<Record<string, number>>({})
+  onClearMockResult,
+}: Pick<
+  ModuleViewProps,
+  'course' | 'mockQuestions' | 'mockResult' | 'onModuleChange' | 'onSubmitMock' | 'onClearMockResult'
+>) {
+  // 仅在没有已交卷成绩时尝试恢复草稿；有成绩时以成绩为准。渲染期一次性读取，避免重复 IO。
+  const draftRef = useRef<MockDraft | null>(null)
+  if (draftRef.current === null && !mockResult) {
+    draftRef.current = readMockDraft(course.id)
+  }
+  const restoredDraft = draftRef.current
+  const hasRestoredDraft = Boolean(restoredDraft && Object.keys(restoredDraft.answers).length > 0)
+
+  const [isExamStarted, setIsExamStarted] = useState(Boolean(mockResult) || hasRestoredDraft)
+  const [questionIndex, setQuestionIndex] = useState(() => {
+    const id = restoredDraft?.currentQuestionId
+    if (id) {
+      const idx = mockQuestions.findIndex((question) => question.id === id)
+      if (idx >= 0) return idx
+    }
+    return 0
+  })
+  const [answers, setAnswers] = useState<Record<string, MockAnswer>>(() =>
+    mockResult?.answers ? { ...mockResult.answers } : (restoredDraft?.answers ?? {}),
+  )
   const [result, setResult] = useState<{
     score: number
     total: number
     results: Array<{ id: string; correct: boolean; explanation: string; mastery: number; generatedSimilarCount: number }>
-  } | null>(null)
+  } | null>(() =>
+    mockResult
+      ? { score: mockResult.score, total: mockResult.total, results: mockResult.results }
+      : null,
+  )
   const [isSubmitting, setIsSubmitting] = useState(false)
   const question = mockQuestions[questionIndex]
   const currentAnswer = question ? answers[question.id] : undefined
   const totalScore = mockQuestions.reduce((sum, item) => sum + item.score, 0)
+  const mockBlueprintSummary = summarizeMockBlueprint(mockQuestions)
+  const currentQuestionType = question ? normalizeMockQuestionType(question) : '模拟题'
+  const isCurrentWrittenQuestion = question ? isWrittenMockQuestion(question) : false
+  const currentWrittenAnswer = typeof currentAnswer === 'string' ? currentAnswer : ''
+  const isCurrentAnswered = question
+    ? isCurrentWrittenQuestion
+      ? currentWrittenAnswer.trim().length > 0
+      : currentAnswer !== undefined
+    : false
+  const allQuestionsAnswered = mockQuestions.every((item) => {
+    const answer = answers[item.id]
+    return isWrittenMockQuestion(item)
+      ? typeof answer === 'string' && answer.trim().length > 0
+      : typeof answer === 'number'
+  })
   const suggestedMinutes = Math.max(60, Math.ceil((mockQuestions.length * 7.5) / 5) * 5)
+
+  // 题目晚到（首次挂载时仍在生成）时，按草稿记录的题号回到上次位置。仅执行一次。
+  const positionRestoredRef = useRef(false)
+  useEffect(() => {
+    if (positionRestoredRef.current || !mockQuestions.length) return
+    const id = restoredDraft?.currentQuestionId
+    if (id) {
+      const idx = mockQuestions.findIndex((question) => question.id === id)
+      if (idx >= 0) setQuestionIndex(idx)
+    }
+    positionRestoredRef.current = true
+  }, [mockQuestions, restoredDraft])
+
+  // 自动持久化：交卷前的每一次作答 / 翻页都写回 localStorage，刷新即可恢复。
+  // 已交卷（有 mockResult）时以成绩为准，不再维护草稿；退回开始页且无作答时清理草稿。
+  useEffect(() => {
+    if (mockResult) return
+    if (!isExamStarted && Object.keys(answers).length === 0) {
+      writeMockDraft(course.id, null)
+      return
+    }
+    const currentQuestionId = mockQuestions[questionIndex]?.id ?? null
+    writeMockDraft(course.id, { answers, currentQuestionId })
+  }, [course.id, mockResult, isExamStarted, answers, questionIndex, mockQuestions])
 
   async function submitMock() {
     setIsSubmitting(true)
     try {
       const response = await onSubmitMock(answers)
       setResult(response)
+      writeMockDraft(course.id, null) // 已交卷，清掉未交卷草稿，避免与成绩混淆
     } finally {
       setIsSubmitting(false)
     }
   }
 
+  async function retakeMock() {
+    if (onClearMockResult) await onClearMockResult()
+    writeMockDraft(course.id, null) // 重新开考，清掉旧草稿
+    setAnswers({})
+    setResult(null)
+    setQuestionIndex(0)
+    setIsExamStarted(true)
+  }
+
   if (!mockQuestions.length) {
-    return <div className="module-page empty-module"><GraduationCap size={32} /><h1>模拟卷演练</h1><p>正在生成{course.name}模拟题。</p></div>
+    return <div className="module-page empty-module"><GraduationCap size={32} /><h1>模拟卷演练</h1><p>{course.name}模拟卷尚未生成。请回到复习策略页修复或重新生成复习主线。</p></div>
   }
 
   return (
@@ -2274,7 +3775,7 @@ function MockView({
           <div className="mock-paper-icon"><FileText size={30} /></div>
           <span>{course.name}冲刺模拟卷 A</span>
           <h2>按完整考试节奏做一套真题风格模拟卷。</h2>
-          <p>包含 {mockQuestions.length} 道单项选择题，覆盖资金时间价值、税后现金流、评价指标、多方案、不确定性分析和 Excel 口径。每题都提供资料依据的讲评。</p>
+          <p>包含 {mockQuestions.length} 道题，共 {totalScore} 分；{mockBlueprintSummary}。每题都提供资料依据的讲评。</p>
           <div className="mock-meta-row">
             <span><Clock3 size={16} /> {suggestedMinutes} 分钟</span>
             <span><ListChecks size={16} /> 共 {totalScore} 分</span>
@@ -2288,25 +3789,33 @@ function MockView({
         <section className="mock-workbench">
           <header>
             <div>
-              <span className="question-label">第 {questionIndex + 1} 题 · 单项选择 · {question.score} 分</span>
-              <h2>{question.prompt}</h2>
+              <span className="question-label">第 {questionIndex + 1} 题 · {currentQuestionType} · {question.score} 分</span>
+              <h2><FormulaText text={question.prompt} /></h2>
               <p className="question-source">参考：{question.source}</p>
             </div>
             <div className="exam-timer"><Clock3 size={17} /> {questionIndex + 1} / {mockQuestions.length}</div>
           </header>
-          <div className="choice-list">
-            {question.options.map((option, index) => (
-              <button
-                className={`choice ${currentAnswer === index ? 'is-selected' : ''}`}
-                key={option}
-                type="button"
-                onClick={() => setAnswers((current) => ({ ...current, [question.id]: index }))}
-              >
-                <b>{String.fromCharCode(65 + index)}</b>
-                <span>{option}</span>
-              </button>
-            ))}
-          </div>
+          {isCurrentWrittenQuestion ? (
+            <textarea
+              value={currentWrittenAnswer}
+              onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
+              placeholder="写出关键计算过程、公式代入和最终答案。"
+            />
+          ) : (
+            <div className="choice-list">
+              {question.options.map((option, index) => (
+                <button
+                  className={`choice ${currentAnswer === index ? 'is-selected' : ''}`}
+                  key={option}
+                  type="button"
+                  onClick={() => setAnswers((current) => ({ ...current, [question.id]: index }))}
+                >
+                  <b>{String.fromCharCode(65 + index)}</b>
+                  <span><FormulaText text={option} /></span>
+                </button>
+              ))}
+            </div>
+          )}
           <footer>
             <button className="secondary-button" type="button" onClick={() => setIsExamStarted(false)}>
               保存并退出
@@ -2315,7 +3824,7 @@ function MockView({
               <button
                 className="primary-button"
                 type="button"
-                disabled={currentAnswer === undefined}
+                disabled={!isCurrentAnswered}
                 onClick={() => setQuestionIndex((current) => current + 1)}
               >
                 下一题 <ArrowRight size={16} />
@@ -2324,7 +3833,7 @@ function MockView({
               <button
                 className="primary-button"
                 type="button"
-                disabled={Object.keys(answers).length !== mockQuestions.length || isSubmitting}
+                disabled={!allQuestionsAnswered || isSubmitting}
                 onClick={submitMock}
               >
                 <Check size={16} /> {isSubmitting ? 'AI 正在批改' : '提交并生成报告'}
@@ -2352,8 +3861,8 @@ function MockView({
                       const reviewedQuestion = mockQuestions.find((questionItem) => questionItem.id === item.id)
                       return (
                         <article key={item.id}>
-                          <strong>{reviewedQuestion?.prompt ?? '模拟卷错题'}</strong>
-                          <p>{item.explanation}</p>
+                          <strong><FormulaText text={reviewedQuestion?.prompt ?? '模拟卷错题'} /></strong>
+                          <p><FormulaText text={item.explanation} /></p>
                         </article>
                       )
                     })}
@@ -2361,6 +3870,9 @@ function MockView({
                 )}
               </div>
               <button type="button" onClick={() => onModuleChange('errors')}>去错题本 <ArrowRight size={15} /></button>
+              {onClearMockResult && (
+                <button type="button" onClick={() => void retakeMock()}>再考一次 <RotateCcw size={15} /></button>
+              )}
             </div>
           )}
         </section>
@@ -2556,7 +4068,7 @@ function ErrorsView({
             </div>
             <span className="question-counter">已错 {activeWrongAnswer.count} 次</span>
           </header>
-          <h2>{question.prompt}</h2>
+          <h2><FormulaText text={question.prompt} /></h2>
           <div className="choice-list">
             {choices.map((choice, index) => {
               const choiceId = String.fromCharCode(65 + index)
@@ -2576,7 +4088,7 @@ function ErrorsView({
                   onClick={() => setSelectedAnswer(index)}
                 >
                   <b>{choiceId}</b>
-                  <span>{choice}</span>
+                  <span><FormulaText text={choice} /></span>
                   {hasAnswered && question.answerIndex === index && <CheckCircle2 size={19} />}
                   {hasAnswered && selectedAnswer === index && question.answerIndex !== index && <CircleAlert size={19} />}
                 </button>
@@ -2599,7 +4111,7 @@ function ErrorsView({
                     : `仍需复练${retryFeedback.generatedSimilarCount ? `，新增 ${retryFeedback.generatedSimilarCount} 道同类练习` : ''}。`}
                 </strong>
               </div>
-              <p>{retryFeedback.explanation}</p>
+              <p><FormulaText text={retryFeedback.explanation} /></p>
             </section>
           )}
 
@@ -2650,7 +4162,7 @@ function ErrorsView({
                     <span>{inferQuestionType(item)}</span>
                     <span>{item.isReviewed ? '已掌握' : '待复练'}</span>
                   </span>
-                  <strong>{question?.prompt ?? item.title}</strong>
+                  <strong><FormulaText text={question?.prompt ?? item.title} /></strong>
                   <span className="error-meta-row">
                     <span><FileText size={13} /> {item.source ?? question?.source ?? item.tag}</span>
                     <span><Clock3 size={13} /> {formatAddedAt(item.addedAt)}</span>
@@ -2784,6 +4296,11 @@ function MaterialSheetPreview({ preview }: { preview: MaterialPreview }) {
   )
 }
 
+function isMarkdownMaterial(preview: MaterialPreview) {
+  const name = preview.name.toLowerCase()
+  return name.endsWith('.md') || name.endsWith('.markdown')
+}
+
 function MaterialPreviewContent({
   preview,
   fileUrl,
@@ -2808,6 +4325,24 @@ function MaterialPreviewContent({
   }
 
   if (preview.kind === 'text') {
+    if (isMarkdownMaterial(preview)) {
+      return (
+        <article className="material-markdown-preview note-markdown-preview">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              a: ({ children, href }) => (
+                <a href={href} target="_blank" rel="noreferrer">
+                  {children}
+                </a>
+              ),
+            }}
+          >
+            {preview.text || preview.message}
+          </ReactMarkdown>
+        </article>
+      )
+    }
     return <pre className="material-text-preview">{preview.text || preview.message}</pre>
   }
 
@@ -2835,20 +4370,28 @@ function MaterialsView({
   materials,
   materialMemory,
   assessmentProfile,
+  strategyDocuments,
+  onSaveCoursePrompt,
   onRescanMaterials,
   onUploadMaterials,
   onDeleteMaterial,
   onMaterialPreviewOpenChange,
+  materialPreviewPath,
+  onMaterialPreviewRequestHandled,
 }: Pick<
   ModuleViewProps,
   | 'course'
   | 'materials'
   | 'materialMemory'
   | 'assessmentProfile'
+  | 'strategyDocuments'
+  | 'onSaveCoursePrompt'
   | 'onRescanMaterials'
   | 'onUploadMaterials'
   | 'onDeleteMaterial'
   | 'onMaterialPreviewOpenChange'
+  | 'materialPreviewPath'
+  | 'onMaterialPreviewRequestHandled'
 >) {
   const [selectedMaterial, setSelectedMaterial] = useState<Material | null>(null)
   const [materialPreview, setMaterialPreview] = useState<MaterialPreview | null>(null)
@@ -2877,32 +4420,83 @@ function MaterialsView({
   const aiPartialCount = materials.filter((file) => file.aiStatus === 'partial').length
   const aiSkippedCount = materials.filter((file) => file.aiStatus === 'skipped').length
   const aiUnreadableCount = materials.filter((file) => file.aiStatus === 'unreadable').length
-  const materialStatusSummary = [
+  const materialStatusItems = [
     `${aiReadyCount} 份 AI 已解析`,
     aiPartialCount ? `${aiPartialCount} 份部分解析` : '',
     aiSkippedCount ? `${aiSkippedCount} 份无需解析` : '',
     aiUnreadableCount ? `${aiUnreadableCount} 份未解析` : '',
-  ].filter(Boolean).join(' / ')
+  ].filter(Boolean)
   const selectedMcpServer = mcpServers.find((server) => server.id === sourceDraft.serverId)
+
+  function getSourceDraftForUrl(
+    url: string,
+    servers: McpServer[],
+    current: typeof sourceDraft,
+  ): typeof sourceDraft {
+    const normalized = url.toLowerCase()
+    const isBilibili = normalized.includes('bilibili.com') || normalized.includes('b23.tv')
+    const isXiaohongshu = normalized.includes('xiaohongshu.com') || normalized.includes('xhslink.com')
+    const isGithub = normalized.includes('github.com')
+    const isArxiv = normalized.includes('arxiv.org')
+    const isWeb = normalized.startsWith('http://') || normalized.startsWith('https://')
+    const matchedServer = isBilibili
+      ? servers.find((server) => server.id === 'mcp-bilibili')
+      : isXiaohongshu
+        ? servers.find((server) => server.id === 'mcp-xiaohongshu')
+        : isArxiv
+          ? servers.find((server) => server.id === 'mcp-arxiv')
+          : isGithub
+            ? servers.find((server) => server.id === 'mcp-gitmcp')
+            : isWeb
+              ? servers.find((server) => server.id === 'mcp-firecrawl')
+              : undefined
+    return {
+      ...current,
+      url,
+      serverId: matchedServer?.id ?? current.serverId,
+      toolName: isBilibili
+        ? matchedServer?.allowedTools.includes('get_video_info') ? 'get_video_info' : matchedServer?.allowedTools[0] ?? current.toolName
+        : isXiaohongshu
+          ? matchedServer?.allowedTools.includes('xhs_get_note') ? 'xhs_get_note' : matchedServer?.allowedTools[0] ?? current.toolName
+          : isArxiv
+            ? matchedServer?.allowedTools.includes('read_paper') ? 'read_paper' : matchedServer?.allowedTools[0] ?? current.toolName
+            : isGithub
+              ? matchedServer?.allowedTools.includes('fetch_repository_documentation') ? 'fetch_repository_documentation' : matchedServer?.allowedTools[0] ?? current.toolName
+              : isWeb
+                ? matchedServer?.allowedTools.includes('firecrawl_scrape') ? 'firecrawl_scrape' : matchedServer?.allowedTools[0] ?? current.toolName
+                : current.toolName,
+      sourceType: isBilibili ? 'video' : isXiaohongshu ? 'note' : isWeb ? 'web' : current.sourceType,
+    }
+  }
+
+  async function refreshMcpServers() {
+    const servers = await listMcpServers()
+    setMcpServers(servers)
+    setSourceDraft((current) => {
+      const currentServer = servers.find((server) => server.id === current.serverId)
+      if (current.url) {
+        return getSourceDraftForUrl(current.url, servers, current)
+      }
+      if (currentServer) {
+        return {
+          ...current,
+          toolName: currentServer.allowedTools.includes(current.toolName)
+            ? current.toolName
+            : currentServer.allowedTools[0] ?? '',
+        }
+      }
+      const first = servers[0]
+      return first
+        ? { ...current, serverId: first.id, toolName: first.allowedTools[0] || '' }
+        : current
+    })
+  }
 
   useEffect(() => {
     let isActive = true
-    void listMcpServers()
-      .then((servers) => {
-        if (!isActive) return
-        setMcpServers(servers)
-        const first = servers[0]
-        if (first) {
-          setSourceDraft((current) => ({
-            ...current,
-            serverId: current.serverId || first.id,
-            toolName: current.toolName || first.allowedTools[0] || '',
-          }))
-        }
-      })
-      .catch((error) => {
-        if (isActive) setRescanError(error instanceof Error ? error.message : '无法读取 MCP 服务配置')
-      })
+    void refreshMcpServers().catch((error) => {
+      if (isActive) setRescanError(error instanceof Error ? error.message : '无法读取 MCP 服务配置')
+    })
     return () => {
       isActive = false
     }
@@ -2930,6 +4524,15 @@ function MaterialsView({
     onMaterialPreviewOpenChange(Boolean(selectedMaterial))
     return () => onMaterialPreviewOpenChange(false)
   }, [onMaterialPreviewOpenChange, selectedMaterial])
+
+  useEffect(() => {
+    if (!materialPreviewPath) return
+    const requestedMaterial = materials.find((material) => material.relativePath === materialPreviewPath)
+    if (requestedMaterial) {
+      setSelectedMaterial(requestedMaterial)
+    }
+    onMaterialPreviewRequestHandled()
+  }, [materialPreviewPath, materials, onMaterialPreviewRequestHandled])
 
   useEffect(() => {
     if (!selectedMaterial) return
@@ -3042,25 +4645,13 @@ function MaterialsView({
   }
 
   function updateExternalSourceUrl(url: string) {
-    const normalized = url.toLowerCase()
-    const isBilibili = normalized.includes('bilibili.com') || normalized.includes('b23.tv')
-    const isXiaohongshu = normalized.includes('xiaohongshu.com') || normalized.includes('xhslink.com')
-    const matchedServer = isBilibili
-      ? mcpServers.find((server) => server.id === 'mcp-bilibili')
-      : isXiaohongshu
-        ? mcpServers.find((server) => server.id === 'mcp-xiaohongshu')
-        : undefined
-    setSourceDraft((current) => ({
-      ...current,
-      url,
-      serverId: matchedServer?.id ?? current.serverId,
-      toolName: isBilibili
-        ? matchedServer?.allowedTools.includes('get_video_info') ? 'get_video_info' : matchedServer?.allowedTools[0] ?? current.toolName
-        : isXiaohongshu
-          ? matchedServer?.allowedTools.includes('xhs_get_note') ? 'xhs_get_note' : matchedServer?.allowedTools[0] ?? current.toolName
-          : current.toolName,
-      sourceType: isBilibili ? 'video' : isXiaohongshu ? 'note' : current.sourceType,
-    }))
+    setSourceDraft((current) => getSourceDraftForUrl(url, mcpServers, current))
+  }
+
+  function refreshMcpServersQuietly() {
+    void refreshMcpServers().catch((error) => {
+      setRescanError(error instanceof Error ? error.message : '无法读取 MCP 服务配置')
+    })
   }
 
   async function submitExternalSource(event: FormEvent<HTMLFormElement>) {
@@ -3165,8 +4756,9 @@ function MaterialsView({
         <input
           type="url"
           value={sourceDraft.url}
-          placeholder="粘贴 B 站视频或小红书笔记完整地址"
+          placeholder="粘贴网页、GitHub、arXiv、B站或小红书笔记地址"
           disabled={!mcpServers.length || isExternalSourceBusy}
+          onFocus={refreshMcpServersQuietly}
           onChange={(event) => updateExternalSourceUrl(event.target.value)}
         />
         <select
@@ -3183,6 +4775,7 @@ function MaterialsView({
           value={sourceDraft.serverId}
           disabled={!mcpServers.length || isExternalSourceBusy}
           aria-label="MCP 服务"
+          onFocus={refreshMcpServersQuietly}
           onChange={(event) => selectMcpServer(event.target.value)}
         >
           {mcpServers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}
@@ -3233,7 +4826,9 @@ function MaterialsView({
           <p>{materialMemory?.summary ?? assessmentProfile.summary}</p>
           {materialMemory?.lastChange && <small>最近同步：{materialMemory.lastChange}</small>}
         </div>
-        <span>{materialStatusSummary}</span>
+        <div className="material-insight-status" aria-label="资料解析统计">
+          {materialStatusItems.map((item) => <span key={item}>{item}</span>)}
+        </div>
       </section>
       {rescanError && <p className="material-rescan-error" role="alert">{rescanError}</p>}
       {materialActionMessage && <p className="material-action-message">{materialActionMessage}</p>}
@@ -3265,6 +4860,7 @@ function MaterialsView({
           </article>
         ))}
       </section>
+      <StrategySection strategyDocuments={strategyDocuments} onSaveCoursePrompt={onSaveCoursePrompt} />
       {selectedMaterial && (
         <div className="modal-backdrop material-preview-backdrop" role="presentation" onMouseDown={closeMaterialPreview}>
           <section
@@ -3311,6 +4907,7 @@ function MaterialsView({
 
 export function ModuleView(props: ModuleViewProps) {
   const title = moduleTitles[props.activeModule]
+  const { onActiveStudyTaskChange } = props
   const [activeStudyTaskId, setActiveStudyTaskId] = useState<string | null>(null)
   const activeStudyTask = props.tasks.find((task) => task.id === activeStudyTaskId)
   const activeKnowledgePoint = activeStudyTask
@@ -3326,6 +4923,10 @@ export function ModuleView(props: ModuleViewProps) {
       window.scrollTo({ top: 0, left: 0 })
     }
   }, [activeStudyTaskId])
+
+  useEffect(() => {
+    onActiveStudyTaskChange?.(activeStudyTask?.id ?? null)
+  }, [activeStudyTask?.id, onActiveStudyTaskChange])
 
   function updateStudyTaskProgress(taskId: string, pageIndex: number, pageCount: number) {
     props.onTasksChange(
@@ -3349,7 +4950,9 @@ export function ModuleView(props: ModuleViewProps) {
         task={activeStudyTask}
         knowledgePoint={activeKnowledgePoint}
         practiceQuestions={props.practiceQuestions}
+        practiceAnswers={props.practiceAnswers}
         onSubmitPractice={props.onSubmitPractice}
+        onClearPracticeAnswer={props.onClearPracticeAnswer}
         onBack={() => setActiveStudyTaskId(null)}
         onPractice={() => {
           setActiveStudyTaskId(null)
@@ -3396,8 +4999,31 @@ export function ModuleView(props: ModuleViewProps) {
   if (props.activeModule === 'materials') {
     return <MaterialsView {...props} />
   }
-  if (props.activeModule === 'strategy') {
-    return <StrategyView {...props} />
+  if (props.activeModule === 'planning') {
+    return <PlanningView courses={props.courses ?? [props.course]} courseWorkspaces={props.courseWorkspaces ?? {}} />
+  }
+  if (props.activeModule === 'mindmap') {
+    return (
+      <Suspense
+        fallback={(
+          <div className="module-page empty-module">
+            <LoaderCircle className="is-spinning" size={32} />
+            <h1>正在打开知识地图</h1>
+            <p>正在加载无限画布。</p>
+          </div>
+        )}
+      >
+        <CourseMindMapView
+          course={props.course}
+          onModuleChange={props.onModuleChange}
+          tasks={props.tasks}
+          knowledgePoints={props.knowledgePoints}
+          practiceQuestions={props.practiceQuestions}
+          mockQuestions={props.mockQuestions}
+          wrongAnswers={props.wrongAnswers}
+        />
+      </Suspense>
+    )
   }
   if (props.activeModule === 'settings') {
     return (
