@@ -3,12 +3,14 @@ import katex from 'katex'
 import 'katex/dist/katex.min.css'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { wrapTextWithTerms } from '../glossary/termMatcher'
 import {
   ArrowRight,
   ArchiveRestore,
   BarChart3,
   BookOpen,
   Brain,
+  CalendarDays,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -17,6 +19,7 @@ import {
   Circle,
   CircleAlert,
   Clock3,
+  Compass,
   ExternalLink,
   Eye,
   FileText,
@@ -351,41 +354,48 @@ function TaskRow({
   onPractice: () => void
 }) {
   const isCompleted = task.status === 'completed'
+  const isOrientation = task.kind === 'orientation'
   const isContentPending = Boolean(task.contentQualityWarning && !task.studyGuide)
-  const actionLabel = isContentPending ? '内容生成中' : isCompleted ? '复习巩固' : task.status === 'in-progress' ? '继续学习' : '开始学习'
-  const guidePreview = task.studyGuide?.examPoints?.length
-    ? `本节覆盖：${task.studyGuide.examPoints.map((point) => point.title).join('、')}`
-    : task.studyGuide?.objectives?.[0]
+  const actionLabel = isOrientation
+    ? task.progress > 0 ? '继续导引' : '开始导引'
+    : isContentPending ? '内容生成中' : isCompleted ? '复习巩固' : task.status === 'in-progress' ? '继续学习' : '开始学习'
+  const guidePreview = isOrientation
+    ? task.studyGuide?.orientation?.overview
+    : task.studyGuide?.examPoints?.length
+      ? `本节覆盖：${task.studyGuide.examPoints.map((point) => point.title).join('、')}`
+      : task.studyGuide?.objectives?.[0]
 
   return (
-    <article className={`plan-task ${task.status === 'completed' ? 'is-completed' : ''}`}>
-      <div className={`task-order ${task.priority}`}>
-        {isCompleted ? <Check size={17} /> : task.order}
+    <article className={`plan-task ${task.status === 'completed' ? 'is-completed' : ''} ${isOrientation ? 'is-orientation' : ''}`}>
+      <div className={`task-order ${isOrientation ? 'orientation' : task.priority}`}>
+        {isCompleted ? <Check size={17} /> : isOrientation ? <Compass size={17} /> : task.order}
       </div>
       <div className="task-details">
         <div className="task-title-line">
           <h3>{task.title}</h3>
-          <span>权重 {task.weight}%</span>
-          {task.priority === 'high' && <em>高优先级</em>}
+          {isOrientation ? <em className="orientation-tag">复习导引</em> : <span>权重 {task.weight}%</span>}
+          {task.priority === 'high' && !isOrientation && <em>高优先级</em>}
         </div>
         <p>{task.description}</p>
-        {guidePreview && <small>速成讲解：{guidePreview}</small>}
-        {task.schedulingReason && <small className="task-scheduling-reason">为什么排在这：{task.schedulingReason}</small>}
+        {guidePreview && <small>{isOrientation ? '' : '速成讲解：'}{guidePreview}</small>}
+        {!isOrientation && task.schedulingReason && <small className="task-scheduling-reason">为什么排在这：{task.schedulingReason}</small>}
         {task.contentQualityWarning && <small className="task-content-warning">{task.contentQualityWarning}</small>}
       </div>
       <div className="task-progress">
-        <span><Clock3 size={14} /> 预计 {task.duration} 分钟</span>
+        <span><Clock3 size={14} /> {isOrientation ? `约 ${task.duration} 分钟 · 不占每日时长` : `预计 ${task.duration} 分钟`}</span>
         <div className="task-progress-line"><i style={{ width: `${task.progress}%` }}></i></div>
         <b>进度 {task.progress}%</b>
       </div>
       <div className="task-actions">
         <button className="soft-action" type="button" disabled={isContentPending} onClick={onStudy}>
-          {isCompleted ? <RotateCcw size={15} /> : <Play size={15} />}
+          {isCompleted ? <RotateCcw size={15} /> : isOrientation ? <Compass size={15} /> : <Play size={15} />}
           {actionLabel}
         </button>
-        <button className="soft-action" type="button" disabled={isContentPending} onClick={onPractice}>
-          <Target size={15} /> 进入练习
-        </button>
+        {!isOrientation && (
+          <button className="soft-action" type="button" disabled={isContentPending} onClick={onPractice}>
+            <Target size={15} /> 进入练习
+          </button>
+        )}
       </div>
     </article>
   )
@@ -593,8 +603,10 @@ function AdjustTodayPlanDialog({
   onRefreshWorkspace: () => Promise<void> | void
 }) {
   const todayDay = dailyProgress?.todayDay ?? 1
-  const focusTasks = tasks.filter((task) => (task.day ?? todayDay) <= todayDay)
-  const otherTasks = tasks.filter((task) => (task.day ?? todayDay) > todayDay)
+  // 第0天·复习导引固定置顶且不参与当日计划调整，全程排除。
+  const adjustableTasks = tasks.filter((task) => task.kind !== 'orientation')
+  const focusTasks = adjustableTasks.filter((task) => (task.day ?? todayDay) <= todayDay)
+  const otherTasks = adjustableTasks.filter((task) => (task.day ?? todayDay) > todayDay)
   // 前置依赖提示：任务草稿 day 早于其未完成前置知识点任务的最大 day 时，行内提示会被后端自动顺延。
   const prereqGateByTask: Record<string, number> = {}
   if (knowledgePoints?.length) {
@@ -623,12 +635,12 @@ function AdjustTodayPlanDialog({
   useEffect(() => {
     if (!open) return
     const nextDrafts: Record<string, PlanDraft> = {}
-    for (const task of tasks) {
+    for (const task of adjustableTasks) {
       nextDrafts[task.id] = { duration: task.duration, day: task.day ?? todayDay, removed: false }
     }
     setDrafts(nextDrafts)
     setPulledTaskId('')
-  }, [open, tasks])
+  }, [open, adjustableTasks, todayDay])
 
   if (!open) return null
 
@@ -642,6 +654,10 @@ function AdjustTodayPlanDialog({
   function applyEdits() {
     const remaining: PlanTask[] = []
     for (const task of tasks) {
+      if (task.kind === 'orientation') {
+        remaining.push(task)
+        continue
+      }
       const draft = drafts[task.id]
       if (!draft || draft.removed) continue
       const nextDay = Math.max(1, Math.min(30, Number(draft.day) || task.day || todayDay))
@@ -651,6 +667,7 @@ function AdjustTodayPlanDialog({
     remaining.sort((left, right) => (left.day ?? todayDay) - (right.day ?? todayDay) || left.order - right.order)
     const dayOrder: Record<number, number> = {}
     for (const task of remaining) {
+      if (task.kind === 'orientation') continue
       const taskDay = task.day ?? todayDay
       dayOrder[taskDay] = (dayOrder[taskDay] ?? 0) + 1
       task.order = dayOrder[taskDay]
@@ -2062,7 +2079,7 @@ function renderLegacyFormulaInline(text: string, keyPrefix: string): ReactNode[]
 
   while ((match = formulaTokenPattern.exec(text))) {
     if (match.index > lastIndex) {
-      nodes.push(text.slice(lastIndex, match.index))
+      nodes.push(...(wrapTextWithTerms(text.slice(lastIndex, match.index), `${keyPrefix}-plain-${lastIndex}`) ?? [text.slice(lastIndex, match.index)]))
     }
 
     const [
@@ -2109,7 +2126,7 @@ function renderLegacyFormulaInline(text: string, keyPrefix: string): ReactNode[]
   }
 
   if (lastIndex < text.length) {
-    nodes.push(text.slice(lastIndex))
+    nodes.push(...(wrapTextWithTerms(text.slice(lastIndex), `${keyPrefix}-plain-${lastIndex}`) ?? [text.slice(lastIndex)]))
   }
 
   return nodes
@@ -2768,6 +2785,273 @@ function buildStudyGuide(task: PlanTask, knowledgePoint: KnowledgePoint | undefi
         ],
       }
   }
+}
+
+// 第0天·复习导引：六页结构化版式（总览→分阶段框架→依赖分层→学习方法→里程碑→检查清单），
+// 复用主线学习的工作台外壳与翻页进度机制；导引不占每日时长，也不进入练习环节。
+function OrientationTaskView({
+  course,
+  task,
+  onBack,
+  onProgressChange,
+}: {
+  course: Course
+  task: PlanTask
+  onBack: () => void
+  onProgressChange: (pageIndex: number, pageCount: number) => void
+}) {
+  const orientation = task.studyGuide?.orientation
+  const [studyPageIndex, setStudyPageIndex] = useState(0)
+  const [checkedItems, setCheckedItems] = useState<Record<number, boolean>>({})
+  const isCompleted = task.status === 'completed'
+
+  const studyPages = useMemo(() => {
+    if (!orientation) return []
+    return [
+      {
+        label: '总览',
+        title: '这门课怎么复习：先建立整体框架',
+        content: (
+          <div className="orientation-overview">
+            <p className="orientation-overview-text">{orientation.overview}</p>
+            <div className="orientation-meta-row">
+              <span><Compass size={15} /> {course.name}</span>
+              {course.examDate ? (
+                <span>
+                  <CalendarDays size={15} /> 距考试{' '}
+                  {Math.max(0, Math.ceil((new Date(course.examDate).getTime() - Date.now()) / 86400000))} 天
+                </span>
+              ) : null}
+              <span><Clock3 size={15} /> 导引约 {task.duration} 分钟 · 不占每日时长</span>
+            </div>
+          </div>
+        ),
+      },
+      {
+        label: '分阶段',
+        title: '复习分几步走：阶段框架与目标',
+        content: (
+          <div className="orientation-phases">
+            {(orientation.phases ?? []).map((phase, index) => (
+              <article className="orientation-phase-card" key={`${phase.title}-${index}`}>
+                <header>
+                  <span>{String(index + 1).padStart(2, '0')}</span>
+                  <strong>{phase.title}</strong>
+                  <em>{phase.dayRange}</em>
+                </header>
+                <p>{phase.goal}</p>
+                {phase.focus?.length ? (
+                  <ul className="orientation-phase-focus">
+                    {phase.focus.map((item) => <li key={item}>{item}</li>)}
+                  </ul>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        ),
+      },
+      {
+        label: '依赖分层',
+        title: '知识点依赖分层：由浅入深的学习路线',
+        content: (
+          <div className="orientation-layers">
+            {(orientation.dependencyLayers ?? []).map((layer) => (
+              <article className="orientation-layer-card" key={`${layer.level}-${layer.title}`}>
+                <header>
+                  <span className="orientation-layer-level">第 {layer.level} 层</span>
+                  <strong>{layer.title}</strong>
+                </header>
+                {layer.rationale ? <p className="orientation-layer-rationale">{layer.rationale}</p> : null}
+                <div className="orientation-kp-chips">
+                  {layer.knowledgePoints.map((name) => (
+                    <span className="orientation-kp-chip" key={name}>{name}</span>
+                  ))}
+                </div>
+              </article>
+            ))}
+          </div>
+        ),
+      },
+      {
+        label: '学习方法',
+        title: '这门课的高效复习方法',
+        content: (
+          <ul className="orientation-method-list">
+            {(orientation.method ?? []).map((item, index) => (
+              <li key={`${item}-${index}`}>
+                <span>{String(index + 1).padStart(2, '0')}</span>
+                <p>{item}</p>
+              </li>
+            ))}
+          </ul>
+        ),
+      },
+      {
+        label: '里程碑',
+        title: '关键节点：到什么时候应该达到什么水平',
+        content: (
+          <div className="orientation-milestones">
+            {(orientation.milestones ?? []).map((milestone, index) => (
+              <div className="orientation-milestone" key={`${milestone.day}-${index}`}>
+                <span className="orientation-milestone-day">第 {milestone.day} 天</span>
+                <div className="orientation-milestone-body">
+                  <strong>{milestone.title}</strong>
+                  {milestone.criteria ? <p>{milestone.criteria}</p> : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        ),
+      },
+      {
+        label: '检查清单',
+        title: '开始复习前，确认这些准备都已就绪',
+        content: (
+          <ul className="orientation-checklist">
+            {(orientation.checklist ?? []).map((item, index) => (
+              <li key={`${item}-${index}`}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(checkedItems[index])}
+                    onChange={(event) => setCheckedItems((current) => ({ ...current, [index]: event.target.checked }))}
+                  />
+                  <span>{item}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        ),
+      },
+    ]
+  }, [orientation, course.name, course.examDate, task.duration, checkedItems])
+
+  useEffect(() => {
+    const initialPageIndex = getInitialStudyPageIndex(task, Math.max(studyPages.length, 1))
+    setStudyPageIndex(initialPageIndex)
+    onProgressChange(initialPageIndex, Math.max(studyPages.length, 1))
+  }, [task.id])
+
+  if (!orientation || !studyPages.length) {
+    return (
+      <div className="module-page plan-page">
+        <section className="page-heading-row">
+          <div>
+            <p className="page-kicker"><BookOpen size={15} /> {course.name} · 复习导引</p>
+            <h1>{task.title}</h1>
+          </div>
+          <button className="secondary-button" type="button" onClick={onBack}>返回主线</button>
+        </section>
+        <section className="question-panel">
+          <p className="study-empty-practice">导引内容缺失，请重新生成复习主线。</p>
+        </section>
+      </div>
+    )
+  }
+
+  const activeStudyPage = studyPages[studyPageIndex] ?? studyPages[0]
+  const displayProgress = isCompleted
+    ? 100
+    : Math.max(task.progress, getStudyProgressForPage(studyPageIndex, studyPages.length))
+
+  function goToStudyPage(pageIndex: number) {
+    const nextPageIndex = Math.min(Math.max(pageIndex, 0), studyPages.length - 1)
+    setStudyPageIndex(nextPageIndex)
+    onProgressChange(nextPageIndex, studyPages.length)
+    window.requestAnimationFrame(() => {
+      document.querySelector('.study-workbench')?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    })
+  }
+
+  return (
+    <div className="module-page plan-page">
+      <section className="page-heading-row">
+        <div>
+          <p className="page-kicker"><Compass size={15} /> {course.name} · 复习导引</p>
+          <h1>{task.title}</h1>
+          <p>{task.description}</p>
+        </div>
+        <button className="secondary-button" type="button" onClick={onBack}>
+          返回主线
+        </button>
+      </section>
+
+      <section className="question-panel study-workbench">
+        <header>
+          <div>
+            <span className="question-label">第 0 天 · 复习导引 · 约 {task.duration} 分钟 · 不占每日时长</span>
+          </div>
+          <span className="question-counter">当前进度 {displayProgress}%</span>
+        </header>
+
+        <div className="study-layout">
+          <nav className="study-page-tabs" aria-label="导引分页">
+            {studyPages.map((page, index) => (
+              <button
+                className={studyPageIndex === index ? 'is-active' : ''}
+                key={page.label}
+                type="button"
+                onClick={() => goToStudyPage(index)}
+              >
+                <span>{String(index + 1).padStart(2, '0')}</span>
+                <strong>{page.label}</strong>
+              </button>
+            ))}
+          </nav>
+
+          <div className="study-page-shell">
+            <section className="study-section">
+              <header className="study-section-heading">
+                <span className="study-step">{studyPageIndex + 1}</span>
+                <div>
+                  <span>{activeStudyPage.label}</span>
+                  <h2>{activeStudyPage.title}</h2>
+                </div>
+              </header>
+              <div className="study-page-content">
+                {activeStudyPage.content}
+              </div>
+            </section>
+
+            <div className="study-page-controls">
+              <button
+                type="button"
+                disabled={studyPageIndex === 0}
+                onClick={() => goToStudyPage(studyPageIndex - 1)}
+              >
+                <ChevronLeft size={15} /> 上一页
+              </button>
+              <span>{studyPageIndex + 1} / {studyPages.length}</span>
+              <button
+                type="button"
+                disabled={studyPageIndex >= studyPages.length - 1}
+                onClick={() => goToStudyPage(studyPageIndex + 1)}
+              >
+                下一页 <ChevronRight size={15} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="practice-bottom-grid">
+        <article className="practice-insight">
+          <Clock3 size={20} />
+          <div>
+            <span>导引状态</span>
+            <strong>{displayProgress >= 100 ? '已读完导引，可以开始第 1 天' : `已记录到 ${displayProgress}%`}</strong>
+          </div>
+        </article>
+        <article className="practice-insight">
+          <Compass size={20} />
+          <div>
+            <span>导引定位</span>
+            <strong>建立整体框架 · 不替代逐知识点学习</strong>
+          </div>
+        </article>
+      </section>
+    </div>
+  )
 }
 
 function StudyTaskView({
@@ -4940,6 +5224,17 @@ export function ModuleView(props: ModuleViewProps) {
           status: nextProgress >= 100 ? 'completed' : 'in-progress',
         }
       }),
+    )
+  }
+
+  if (activeStudyTask?.kind === 'orientation' && (props.activeModule === 'overview' || props.activeModule === 'plan')) {
+    return (
+      <OrientationTaskView
+        course={props.course}
+        task={activeStudyTask}
+        onBack={() => setActiveStudyTaskId(null)}
+        onProgressChange={(pageIndex, pageCount) => updateStudyTaskProgress(activeStudyTask.id, pageIndex, pageCount)}
+      />
     )
   }
 

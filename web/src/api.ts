@@ -7,6 +7,9 @@ import type {
   DailyProgress,
   EmbeddingProfile,
   ExternalSource,
+  GlossaryResponse,
+  GlossaryStatus,
+  GlossaryTerm,
   KnowledgeBaseStatus,
   MaterialPreview,
   McpServer,
@@ -782,5 +785,121 @@ export function toRuntimeModelProfile(
     supportsVision: true,
     status: runtimeModel.connected ? 'connected' : 'unconfigured',
     statusMessage: runtimeModel.connected ? '已由本机服务配置并连接' : '本机模型尚未配置',
+  }
+}
+
+type GlossaryTermApiResponse = {
+  id: string
+  term: string
+  matchKey?: string
+  aliases: string[]
+  oneLiner: string
+  article: string
+  examTips: string[]
+  pitfalls: string[]
+  knowledgePointId?: string
+  relatedKnowledgePointIds: string[]
+  moduleId?: string
+  importance: 'core' | 'extended'
+  status: 'draft' | 'active' | 'inactive'
+  origin: 'curator' | 'manual'
+  updatedAt?: string
+}
+
+type GlossaryStatusApiResponse = {
+  courseId: string
+  status: 'idle' | 'generating' | 'ready' | 'failed'
+  termsTotal: number
+  termsActive: number
+  lastError: string
+  lastRefreshedAt: string
+}
+
+function toGlossaryTerm(response: GlossaryTermApiResponse): GlossaryTerm {
+  return {
+    id: response.id,
+    term: response.term,
+    aliases: response.aliases ?? [],
+    oneLiner: response.oneLiner ?? '',
+    article: response.article ?? '',
+    examTips: response.examTips ?? [],
+    pitfalls: response.pitfalls ?? [],
+    knowledgePointId: response.knowledgePointId || undefined,
+    relatedKnowledgePointIds: response.relatedKnowledgePointIds ?? [],
+    moduleId: response.moduleId || undefined,
+    importance: response.importance ?? 'core',
+    status: response.status ?? 'active',
+    origin: response.origin ?? 'curator',
+    updatedAt: response.updatedAt ?? '',
+  }
+}
+
+function toGlossaryStatus(courseId: string, response: GlossaryStatusApiResponse): GlossaryStatus {
+  return {
+    courseId,
+    status: response.status ?? 'idle',
+    termsTotal: response.termsTotal ?? 0,
+    termsActive: response.termsActive ?? 0,
+    lastError: response.lastError ?? '',
+    lastRefreshedAt: response.lastRefreshedAt ?? '',
+  }
+}
+
+export async function getCourseGlossary(courseId: string): Promise<GlossaryResponse> {
+  const response = await request<{ courseId: string; terms: GlossaryTermApiResponse[]; status: GlossaryStatusApiResponse }>(
+    `/courses/${encodeURIComponent(courseId)}/glossary`,
+  )
+  return {
+    courseId,
+    terms: (response.terms ?? []).map(toGlossaryTerm),
+    status: toGlossaryStatus(courseId, response.status ?? ({ courseId: response.courseId } as GlossaryStatusApiResponse)),
+  }
+}
+
+export async function getCourseGlossaryStatus(courseId: string): Promise<GlossaryStatus> {
+  const response = await request<GlossaryStatusApiResponse>(
+    `/courses/${encodeURIComponent(courseId)}/glossary/status`,
+  )
+  return toGlossaryStatus(courseId, response)
+}
+
+export async function refreshCourseGlossary(courseId: string, force = false): Promise<{ jobId: string; courseId: string }> {
+  return request(`/courses/${encodeURIComponent(courseId)}/glossary/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  })
+}
+
+export async function updateGlossaryTerm(
+  courseId: string,
+  termId: string,
+  fields: Partial<Pick<GlossaryTerm, 'term' | 'aliases' | 'oneLiner' | 'article' | 'examTips' | 'pitfalls' | 'importance' | 'status'>>,
+): Promise<GlossaryTerm> {
+  const payload: Record<string, unknown> = {}
+  if (fields.term !== undefined) payload.term = fields.term
+  if (fields.aliases !== undefined) payload.aliases = fields.aliases
+  if (fields.oneLiner !== undefined) payload.one_liner = fields.oneLiner
+  if (fields.article !== undefined) payload.article = fields.article
+  if (fields.examTips !== undefined) payload.exam_tips = fields.examTips
+  if (fields.pitfalls !== undefined) payload.pitfalls = fields.pitfalls
+  if (fields.importance !== undefined) payload.importance = fields.importance
+  if (fields.status !== undefined) payload.status = fields.status
+  const response = await request<{ term: GlossaryTermApiResponse }>(
+    `/courses/${encodeURIComponent(courseId)}/glossary/terms/${encodeURIComponent(termId)}`,
+    { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+  )
+  return toGlossaryTerm(response.term)
+}
+
+export async function deleteGlossaryTerm(courseId: string, termId: string): Promise<GlossaryResponse> {
+  const response = await request<{ courseId: string; terms: GlossaryTermApiResponse[]; status: GlossaryStatusApiResponse }>(
+    `/courses/${encodeURIComponent(courseId)}/glossary/terms/${encodeURIComponent(termId)}`,
+    { method: 'DELETE' },
+  )
+  return {
+    courseId,
+    terms: (response.terms ?? []).map(toGlossaryTerm),
+    status: toGlossaryStatus(courseId, response.status ?? ({ courseId: response.courseId } as GlossaryStatusApiResponse)),
   }
 }

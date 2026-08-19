@@ -71,6 +71,7 @@ import { ModuleView } from './components/ModuleView'
 import { SelectionToNoteToolbar } from './components/SelectionToNoteToolbar'
 import { TopbarCourseTimer } from './components/TopbarCourseTimer'
 import { CourseTimerProvider } from './hooks/useCourseTimer'
+import { GlossaryProvider } from './hooks/useGlossary'
 import { useSpecularButtons } from './hooks/useSpecularButtons'
 import { buildCourseTimeline, summarizeTimeline, COURSE_CATEGORY_TABS, type CourseTimelineCategory } from './utils/courseTimeline'
 import type {
@@ -1459,6 +1460,7 @@ function App() {
   }
 
   return (
+    <GlossaryProvider courseId={activeCourseId}>
     <CourseTimerProvider onRecordMinutes={handleRecordMinutes}>
     <div
       className={`app-shell${isAiCollapsed ? ' is-ai-collapsed' : ''}${isAiOpen ? ' is-ai-open' : ''}${isMaterialPreviewOpen ? ' is-material-preview-open' : ''}${isAiResizing ? ' is-ai-resizing' : ''}`}
@@ -1767,6 +1769,7 @@ function App() {
       <SelectionToNoteToolbar onAddToNote={appendNoteSnippet} />
     </div>
     </CourseTimerProvider>
+    </GlossaryProvider>
   )
 }
 

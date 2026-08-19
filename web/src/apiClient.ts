@@ -66,6 +66,11 @@ export const deleteCourseWrongAnswer = impl.deleteCourseWrongAnswer
 export const listArchiveItems = impl.listArchiveItems
 export const restoreArchiveItem = impl.restoreArchiveItem
 export const toRuntimeModelProfile = impl.toRuntimeModelProfile
+export const getCourseGlossary = impl.getCourseGlossary
+export const getCourseGlossaryStatus = impl.getCourseGlossaryStatus
+export const refreshCourseGlossary = impl.refreshCourseGlossary
+export const updateGlossaryTerm = impl.updateGlossaryTerm
+export const deleteGlossaryTerm = impl.deleteGlossaryTerm
 
 export type {
   AgentStreamDone,
