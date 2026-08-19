@@ -121,6 +121,35 @@ export type StudyGuideSection = {
   checklist?: string[]
 }
 
+export type OrientationPhase = {
+  title: string
+  dayRange: string
+  goal: string
+  focus?: string[]
+}
+
+export type OrientationDependencyLayer = {
+  level: number
+  title: string
+  knowledgePoints: string[]
+  rationale?: string
+}
+
+export type OrientationMilestone = {
+  day: number
+  title: string
+  criteria?: string
+}
+
+export type OrientationGuide = {
+  overview: string
+  phases: OrientationPhase[]
+  dependencyLayers: OrientationDependencyLayer[]
+  method: string[]
+  milestones: OrientationMilestone[]
+  checklist: string[]
+}
+
 export type StudyGuide = {
   planningReason?: string
   examPoints?: StudyExamPoint[]
@@ -137,6 +166,7 @@ export type StudyGuide = {
   }
   checklist?: string[]
   sections?: StudyGuideSection[]
+  orientation?: OrientationGuide
 }
 
 export type EmbeddingProfile = {
@@ -193,6 +223,7 @@ export type ExternalSource = {
 export type PlanTask = {
   id: string
   courseId: string
+  kind?: 'orientation'
   day?: number
   order: number
   title: string
@@ -575,4 +606,36 @@ export type DailyProgress = {
   remaining: number
   overBudget: boolean
   overdue: OverdueTaskRef[]
+}
+
+export type GlossaryTerm = {
+  id: string
+  term: string
+  aliases: string[]
+  oneLiner: string
+  article: string
+  examTips: string[]
+  pitfalls: string[]
+  knowledgePointId?: string
+  relatedKnowledgePointIds: string[]
+  moduleId?: string
+  importance: 'core' | 'extended'
+  status: 'draft' | 'active' | 'inactive'
+  origin: 'curator' | 'manual'
+  updatedAt: string
+}
+
+export type GlossaryStatus = {
+  courseId: string
+  status: 'idle' | 'generating' | 'ready' | 'failed'
+  termsTotal: number
+  termsActive: number
+  lastError: string
+  lastRefreshedAt: string
+}
+
+export type GlossaryResponse = {
+  courseId: string
+  terms: GlossaryTerm[]
+  status: GlossaryStatus
 }

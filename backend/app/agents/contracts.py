@@ -80,3 +80,29 @@ class AgentToolCall(BaseModel):
     id: str
     name: str
     arguments: dict[str, Any]
+
+
+class GlossaryCandidate(BaseModel):
+    """Glossary Scanner Agent 的输出：候选术语条目。"""
+
+    term: str = Field(min_length=1, max_length=60)
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    importance: Literal["core", "extended"]
+    knowledge_point_id: str = ""
+    module_id: str = ""
+    rationale: str = ""
+
+
+class GlossaryTermSpec(BaseModel):
+    """Glossary Curator Agent 的输出：完整词条。"""
+
+    term: str = Field(min_length=1, max_length=60)
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    one_liner: str = Field(min_length=1, max_length=120)
+    article: str = Field(min_length=20, max_length=1200)
+    exam_tips: list[str] = Field(default_factory=list, max_length=6)
+    pitfalls: list[str] = Field(default_factory=list, max_length=6)
+    knowledge_point_id: str = ""
+    related_knowledge_point_ids: list[str] = Field(default_factory=list, max_length=5)
+    module_id: str = ""
+    importance: Literal["core", "extended"] = "core"

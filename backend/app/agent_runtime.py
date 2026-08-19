@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -143,6 +144,39 @@ def initialize_agent_database() -> None:
                 allowed_tools_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS glossary_terms (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL,
+                term TEXT NOT NULL,
+                match_key TEXT NOT NULL,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                one_liner TEXT NOT NULL DEFAULT '',
+                article TEXT NOT NULL DEFAULT '',
+                exam_tips_json TEXT NOT NULL DEFAULT '[]',
+                pitfalls_json TEXT NOT NULL DEFAULT '[]',
+                knowledge_point_id TEXT NOT NULL DEFAULT '',
+                related_knowledge_point_ids_json TEXT NOT NULL DEFAULT '[]',
+                module_id TEXT NOT NULL DEFAULT '',
+                importance TEXT NOT NULL DEFAULT 'core',
+                status TEXT NOT NULL DEFAULT 'active',
+                origin TEXT NOT NULL DEFAULT 'curator',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (course_id, match_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_glossary_terms_course
+                ON glossary_terms (course_id, status, importance);
+
+            CREATE TABLE IF NOT EXISTS glossary_refresh_state (
+                course_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'idle',
+                content_signature TEXT NOT NULL DEFAULT '',
+                terms_total INTEGER NOT NULL DEFAULT 0,
+                terms_active INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                last_refreshed_at TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -622,3 +656,276 @@ def get_external_source(course_id: str, source_id: str) -> dict[str, Any]:
         "metadata": json.loads(row["metadata_json"]),
         "error": str(row["error"]),
     }
+
+
+GLOSSARY_IMPORTANCE_VALUES = {"core", "extended"}
+GLOSSARY_STATUS_VALUES = {"draft", "active", "inactive"}
+
+
+def glossary_match_key(term: str) -> str:
+    """术语归一化匹配键：去空白/连字符/间隔号后小写，用于 (course_id, match_key) 唯一去重。"""
+    return re.sub(r"[\s\-_·]", "", term).casefold()
+
+
+def _glossary_term_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "courseId": str(row["course_id"]),
+        "term": str(row["term"]),
+        "matchKey": str(row["match_key"]),
+        "aliases": json.loads(row["aliases_json"]),
+        "oneLiner": str(row["one_liner"]),
+        "article": str(row["article"]),
+        "examTips": json.loads(row["exam_tips_json"]),
+        "pitfalls": json.loads(row["pitfalls_json"]),
+        "knowledgePointId": str(row["knowledge_point_id"]),
+        "relatedKnowledgePointIds": json.loads(row["related_knowledge_point_ids_json"]),
+        "moduleId": str(row["module_id"]),
+        "importance": str(row["importance"]),
+        "status": str(row["status"]),
+        "origin": str(row["origin"]),
+        "createdAt": str(row["created_at"]),
+        "updatedAt": str(row["updated_at"]),
+    }
+
+
+def upsert_glossary_term(course_id: str, term_data: dict[str, Any], *, origin: str = "curator") -> dict[str, Any]:
+    """按 (course_id, match_key) 幂等写入词条。
+
+    - 已存在且 origin=manual：只合并新别名，正文/状态一律不动（用户手动编辑优先于 AI 刷新）。
+    - 已存在且 origin=curator：全量覆盖内容字段并复活为 active。
+    - 不存在：插入，active 起步（占位词条可传 status='draft'）。
+    """
+    initialize_agent_database()
+    term = str(term_data.get("term", "")).strip()
+    if not term:
+        raise ValueError("术语名不能为空")
+    match_key = glossary_match_key(term)
+    aliases = [str(alias).strip() for alias in term_data.get("aliases", []) if str(alias).strip()]
+    timestamp = _now()
+    existing_row = None
+    with _connection() as connection:
+        existing_row = connection.execute(
+            "SELECT * FROM glossary_terms WHERE course_id = ? AND match_key = ?",
+            (course_id, match_key),
+        ).fetchone()
+        if existing_row is None:
+            term_id = f"term-{uuid.uuid4().hex[:12]}"
+            connection.execute(
+                """
+                INSERT INTO glossary_terms (
+                    id, course_id, term, match_key, aliases_json, one_liner, article,
+                    exam_tips_json, pitfalls_json, knowledge_point_id,
+                    related_knowledge_point_ids_json, module_id, importance, status,
+                    origin, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    term_id,
+                    course_id,
+                    term,
+                    match_key,
+                    json.dumps(aliases, ensure_ascii=False),
+                    str(term_data.get("one_liner", "")),
+                    str(term_data.get("article", "")),
+                    json.dumps(list(term_data.get("exam_tips", [])), ensure_ascii=False),
+                    json.dumps(list(term_data.get("pitfalls", [])), ensure_ascii=False),
+                    str(term_data.get("knowledge_point_id", "")),
+                    json.dumps(list(term_data.get("related_knowledge_point_ids", [])), ensure_ascii=False),
+                    str(term_data.get("module_id", "")),
+                    str(term_data.get("importance", "core")),
+                    str(term_data.get("status", "active")),
+                    origin,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        elif str(existing_row["origin"]) == "manual" and origin == "curator":
+            merged_aliases = list(dict.fromkeys(json.loads(existing_row["aliases_json"]) + aliases))
+            connection.execute(
+                "UPDATE glossary_terms SET aliases_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(merged_aliases, ensure_ascii=False), timestamp, str(existing_row["id"])),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE glossary_terms SET
+                    term = ?, aliases_json = ?, one_liner = ?, article = ?,
+                    exam_tips_json = ?, pitfalls_json = ?, knowledge_point_id = ?,
+                    related_knowledge_point_ids_json = ?, module_id = ?, importance = ?,
+                    status = 'active', updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    term,
+                    json.dumps(aliases, ensure_ascii=False),
+                    str(term_data.get("one_liner", existing_row["one_liner"])),
+                    str(term_data.get("article", existing_row["article"])),
+                    json.dumps(list(term_data.get("exam_tips", json.loads(existing_row["exam_tips_json"]))), ensure_ascii=False),
+                    json.dumps(list(term_data.get("pitfalls", json.loads(existing_row["pitfalls_json"]))), ensure_ascii=False),
+                    str(term_data.get("knowledge_point_id", existing_row["knowledge_point_id"])),
+                    json.dumps(list(term_data.get("related_knowledge_point_ids", json.loads(existing_row["related_knowledge_point_ids_json"]))), ensure_ascii=False),
+                    str(term_data.get("module_id", existing_row["module_id"])),
+                    str(term_data.get("importance", existing_row["importance"])),
+                    timestamp,
+                    str(existing_row["id"]),
+                ),
+            )
+        row = connection.execute(
+            "SELECT * FROM glossary_terms WHERE course_id = ? AND match_key = ?",
+            (course_id, match_key),
+        ).fetchone()
+    assert row is not None
+    return _glossary_term_row_to_dict(row)
+
+
+def list_glossary_terms(course_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
+    initialize_agent_database()
+    with _connection() as connection:
+        if include_inactive:
+            rows = connection.execute(
+                "SELECT * FROM glossary_terms WHERE course_id = ? ORDER BY importance DESC, term",
+                (course_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM glossary_terms WHERE course_id = ? AND status != 'inactive' ORDER BY importance DESC, term",
+                (course_id,),
+            ).fetchall()
+    return [_glossary_term_row_to_dict(row) for row in rows]
+
+
+def get_glossary_term(course_id: str, term_id: str) -> dict[str, Any]:
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM glossary_terms WHERE id = ? AND course_id = ?",
+            (term_id, course_id),
+        ).fetchone()
+    if row is None:
+        raise KeyError("术语词条不存在")
+    return _glossary_term_row_to_dict(row)
+
+
+GLOSSARY_EDITABLE_COLUMNS = {
+    "term": "term",
+    "one_liner": "one_liner",
+    "article": "article",
+    "knowledge_point_id": "knowledge_point_id",
+    "module_id": "module_id",
+    "importance": "importance",
+    "status": "status",
+}
+
+
+def update_glossary_term_fields(course_id: str, term_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """手动编辑词条：只更新白名单列，置 origin='manual'，改 term 时同步重算 match_key。"""
+    updates = {key: value for key, value in fields.items() if key in GLOSSARY_EDITABLE_COLUMNS}
+    if not updates:
+        return get_glossary_term(course_id, term_id)
+    if "importance" in updates and updates["importance"] not in GLOSSARY_IMPORTANCE_VALUES:
+        raise ValueError("importance 取值无效")
+    if "status" in updates and updates["status"] not in GLOSSARY_STATUS_VALUES:
+        raise ValueError("status 取值无效")
+    for list_field in ("aliases", "exam_tips", "pitfalls", "related_knowledge_point_ids"):
+        if list_field in fields:
+            updates[list_field] = [str(item) for item in fields[list_field]]
+    if "term" in updates:
+        term = str(updates["term"]).strip()
+        if not term:
+            raise ValueError("术语名不能为空")
+        updates["term"] = term
+        updates["match_key"] = glossary_match_key(term)
+    column_values: dict[str, Any] = {}
+    for key, value in updates.items():
+        if key in {"aliases", "exam_tips", "pitfalls", "related_knowledge_point_ids"}:
+            column_values[f"{key}_json"] = json.dumps(value, ensure_ascii=False)
+        elif key == "match_key":
+            column_values["match_key"] = value
+        else:
+            column_values[key] = value
+    assignments = ", ".join(f"{key} = ?" for key in column_values)
+    with _connection() as connection:
+        changed = connection.execute(
+            f"UPDATE glossary_terms SET {assignments}, origin = 'manual', updated_at = ? WHERE id = ? AND course_id = ?",
+            (*column_values.values(), _now(), term_id, course_id),
+        ).rowcount
+    if not changed:
+        raise KeyError("术语词条不存在")
+    return get_glossary_term(course_id, term_id)
+
+
+def delete_glossary_term(course_id: str, term_id: str) -> None:
+    with _connection() as connection:
+        changed = connection.execute(
+            "DELETE FROM glossary_terms WHERE id = ? AND course_id = ?",
+            (term_id, course_id),
+        ).rowcount
+    if not changed:
+        raise KeyError("术语词条不存在")
+
+
+def set_glossary_terms_status(course_id: str, match_keys: list[str], status: str) -> int:
+    """按 match_key 批量切换状态（增量刷新用于失活/恢复），只影响 curator 词条。返回受影响行数。"""
+    if status not in GLOSSARY_STATUS_VALUES:
+        raise ValueError("status 取值无效")
+    if not match_keys:
+        return 0
+    placeholders = ", ".join("?" for _ in match_keys)
+    with _connection() as connection:
+        changed = connection.execute(
+            f"UPDATE glossary_terms SET status = ?, updated_at = ? WHERE course_id = ? AND match_key IN ({placeholders}) AND origin = 'curator'",
+            (status, _now(), course_id, *match_keys),
+        ).rowcount
+    return int(changed)
+
+
+def get_glossary_refresh_state(course_id: str) -> dict[str, Any]:
+    initialize_agent_database()
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM glossary_refresh_state WHERE course_id = ?",
+            (course_id,),
+        ).fetchone()
+    if row is None:
+        return {
+            "courseId": course_id,
+            "status": "idle",
+            "contentSignature": "",
+            "termsTotal": 0,
+            "termsActive": 0,
+            "lastError": "",
+            "lastRefreshedAt": "",
+        }
+    return {
+        "courseId": str(row["course_id"]),
+        "status": str(row["status"]),
+        "contentSignature": str(row["content_signature"]),
+        "termsTotal": int(row["terms_total"]),
+        "termsActive": int(row["terms_active"]),
+        "lastError": str(row["last_error"]),
+        "lastRefreshedAt": str(row["last_refreshed_at"]),
+    }
+
+
+def save_glossary_refresh_state(course_id: str, **fields: Any) -> dict[str, Any]:
+    allowed = {"status", "content_signature", "terms_total", "terms_active", "last_error", "last_refreshed_at"}
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT course_id FROM glossary_refresh_state WHERE course_id = ?",
+            (course_id,),
+        ).fetchone()
+        if row is None:
+            columns = ["course_id", *updates.keys()]
+            placeholders = ", ".join("?" for _ in columns)
+            connection.execute(
+                f"INSERT INTO glossary_refresh_state ({', '.join(columns)}) VALUES ({placeholders})",
+                (course_id, *updates.values()),
+            )
+        else:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            connection.execute(
+                f"UPDATE glossary_refresh_state SET {assignments} WHERE course_id = ?",
+                (*updates.values(), course_id),
+            )
+    return get_glossary_refresh_state(course_id)
