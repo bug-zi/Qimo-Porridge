@@ -21,11 +21,11 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 from zipfile import ZipFile
 
-from .agent_runtime import create_adjustment_proposal
-from .agents import run_content_workflow, run_strategy_workflow, with_structured_formula_rules
+from .agent_runtime import create_adjustment_proposal, enqueue_agent_job
+from .agents import ORIENTATION_TASK_ID, build_orientation_guide, run_content_workflow, run_strategy_workflow, with_structured_formula_rules
 from .agents.tools import apply_operations_to_copy
 from .agents.tutor import run_tutor_agent, run_tutor_agent_stream
-from .agents.workflow import _shuffle_single_choice_options, _shuffle_single_choice_questions
+from .agents.workflow import _make_orientation_task, _shuffle_single_choice_options, _shuffle_single_choice_questions
 from . import ocr_service
 from . import study_scheduler
 from .knowledge_service import (
@@ -164,14 +164,16 @@ def _remap_tasks_to_review_sessions(tasks: list[dict[str, Any]], days: int, revi
     session_days = _review_session_days(days, review_count)
     if not session_days:
         return
-    ai_days = sorted({int(t["day"]) for t in tasks if isinstance(t.get("day"), int)})
+    # 导引任务（day=0）不参与收集与映射，否则 0 混入 ai_days 会让所有任务整体错位一格。
+    session_tasks = [t for t in tasks if not study_scheduler.is_orientation(t)]
+    ai_days = sorted({int(t["day"]) for t in session_tasks if isinstance(t.get("day"), int)})
     if not ai_days:
         return
     day_map = {
         ai_day: session_days[min(i, len(session_days) - 1)]
         for i, ai_day in enumerate(ai_days)
     }
-    for task in tasks:
+    for task in session_tasks:
         task["day"] = day_map.get(int(task.get("day", 1)), session_days[0])
 
 
@@ -2447,6 +2449,12 @@ def _ensure_workspace_content_quality(workspace: dict[str, Any]) -> bool:
     for task in workspace.get("tasks", []):
         if not isinstance(task, dict):
             continue
+        if study_scheduler.is_orientation(task):
+            # 导引任务的 studyGuide 是 orientation 专属结构，不走 examPoints 判定
+            # 与 4 段式 sections 规范化，也不应被打"讲义不完整"警告。
+            if task.pop("contentQualityWarning", None) is not None:
+                changed = True
+            continue
         guide = task.get("studyGuide")
         if isinstance(guide, dict) and "example" not in guide and isinstance(guide.get("workedExample"), dict):
             guide["example"] = guide["workedExample"]
@@ -3731,9 +3739,49 @@ def approve_strategy_documents(
         strategy_documents["reviewReport"] = result["reviewReport"]
         workspace["generationWarning"] = ""
         save_workspace(workspace, course_id)
+        # 复习主线落盘后异步刷新术语词条（幂等 job，资料未变时秒回）
+        try:
+            enqueue_agent_job(course_id, "glossary_refresh", {"event": "复习主线生成完成"}, max_attempts=2)
+        except Exception:
+            pass  # 术语刷新失败不影响主线生成结果
         return workspace
     finally:
         generation_lock.release()
+
+
+def run_glossary_refresh_job(course_id: str, event: str = "", *, force: bool = False) -> dict[str, Any]:
+    """glossary_refresh 后台 job 入口：加载 workspace 并执行术语刷新。"""
+    from .agents.glossary import run_glossary_refresh
+
+    workspace = load_workspace(course_id, refresh_materials=False)
+    return run_glossary_refresh(course_id, workspace, _model_json, event=event, force=force)
+
+
+def ensure_orientation_task(course_id: str, *, force: bool = False) -> dict[str, Any]:
+    """为已有课程补生成第0天·复习导引任务（幂等；force=True 时重新生成）。"""
+    workspace = load_workspace(course_id, refresh_materials=False)
+    tasks = [t for t in workspace.get("tasks", []) if isinstance(t, dict)]
+    existing = [t for t in tasks if study_scheduler.is_orientation(t)]
+    if existing and not force:
+        return workspace
+
+    guide, degraded = build_orientation_guide(
+        _model_json,
+        course_id=course_id,
+        course=workspace.get("course", {}),
+        onboarding=workspace.get("onboarding", {}),
+        review_plan=_read_strategy_document(course_id, "reviewPlan"),
+        course_prompt=get_course_prompt(course_id),
+        modules=workspace.get("modules", []),
+        knowledge_points=workspace.get("knowledgePoints", []),
+        tasks=[t for t in tasks if not study_scheduler.is_orientation(t)],
+        diagnostic=workspace.get("diagnostic", {}),
+        assessment_profile=workspace.get("assessmentProfile", {}),
+    )
+    orientation_task = _make_orientation_task(course_id, guide)
+    workspace["tasks"] = [orientation_task] + [t for t in tasks if not study_scheduler.is_orientation(t)]
+    save_workspace(workspace, course_id)
+    return workspace
 
 
 def update_course_prompt(
@@ -3885,7 +3933,10 @@ def build_daily_progress(
             "status": task.get("status"),
         }
         for task in tasks
-        if int(task.get("day", 0)) < today_day and task.get("status") != "completed"
+        if int(task.get("day", 0)) < today_day
+        and task.get("status") != "completed"
+        # 导引任务 day=0 恒小于 today_day，但不参与逾期判定（随时可看，不算逾期）。
+        and not study_scheduler.is_orientation(task)
     ]
     remaining = max(0, planned_today - spent_today)
     over_budget = planned_today > 0 and spent_today > planned_today
@@ -3962,7 +4013,7 @@ def rebalance_daily_plan(course_id: str, event: str = "每日时间核对") -> N
                 "priority": task.get("priority"),
             }
             for task in workspace.get("tasks", [])
-            if isinstance(task, dict)
+            if isinstance(task, dict) and not study_scheduler.is_orientation(task)
         ],
     }
     task_prompt = """
@@ -4052,7 +4103,9 @@ def replan_review_mainline(
 
     all_tasks = [task for task in workspace.get("tasks", []) if isinstance(task, dict)]
     movable_ids = {
-        str(task.get("id")) for task in all_tasks if task.get("status") != "completed"
+        str(task.get("id"))
+        for task in all_tasks
+        if task.get("status") != "completed" and not study_scheduler.is_orientation(task)
     }
 
     compact_state = {

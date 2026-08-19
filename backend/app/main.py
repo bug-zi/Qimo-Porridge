@@ -17,13 +17,18 @@ from pydantic import BaseModel, Field
 
 from .agent_runtime import (
     AgentJobWorker,
+    delete_glossary_term,
     enqueue_agent_job,
     get_agent_job,
     get_agent_run,
     get_external_source,
+    get_glossary_refresh_state,
+    get_glossary_term,
     initialize_agent_database,
     last_proposal_resolution_at,
+    list_glossary_terms,
     list_pending_proposals,
+    update_glossary_term_fields,
 )
 from .agents.tools import apply_proposal, dismiss_proposal
 from .external_source_service import (
@@ -90,6 +95,7 @@ from .study_service import (
     rebalance_daily_plan,
     update_course_plan_params,
     replan_review_mainline,
+    run_glossary_refresh_job,
 )
 
 DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
@@ -133,12 +139,21 @@ def _recently_resolved_proposal(course_id: str) -> bool:
         return False
 
 
+def _glossary_refresh_job(course_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return run_glossary_refresh_job(
+        course_id,
+        str(payload.get("event", "")),
+        force=bool(payload.get("force", False)),
+    )
+
+
 AGENT_JOB_WORKER = AgentJobWorker(
     {
         "maintain_review_plan": _maintain_plan_job,
         "external_source_import": process_external_source_job,
         "approve_strategy_documents": _approve_strategy_documents_job,
         "rebalance_daily_plan": _rebalance_plan_job,
+        "glossary_refresh": _glossary_refresh_job,
     }
 )
 
@@ -424,6 +439,24 @@ class ExternalSourceRequest(BaseModel):
     mcp_server_id: str = Field(min_length=1, max_length=120)
     tool_name: str = Field(min_length=1, max_length=200)
     source_type: Literal["web", "video", "note"] = "web"
+
+
+class GlossaryTermUpdateRequest(BaseModel):
+    term: str | None = Field(default=None, min_length=1, max_length=60)
+    aliases: list[str] | None = Field(default=None, max_length=8)
+    one_liner: str | None = Field(default=None, max_length=200)
+    article: str | None = Field(default=None, max_length=4000)
+    exam_tips: list[str] | None = Field(default=None, max_length=6)
+    pitfalls: list[str] | None = Field(default=None, max_length=6)
+    knowledge_point_id: str | None = None
+    related_knowledge_point_ids: list[str] | None = Field(default=None, max_length=5)
+    module_id: str | None = None
+    importance: Literal["core", "extended"] | None = None
+    status: Literal["draft", "active", "inactive"] | None = None
+
+
+class GlossaryRefreshRequest(BaseModel):
+    force: bool = False
 
 
 class ArchiveItemResponse(BaseModel):
@@ -1063,6 +1096,7 @@ async def upload_course_material_batch(
         workspace = upload_course_materials(files, course_id)
         if mark_strategy_maintenance_pending(course_id, "课程资料发生变化"):
             enqueue_agent_job(course_id, "maintain_review_plan", {"event": "课程资料发生变化"})
+            enqueue_agent_job(course_id, "glossary_refresh", {"event": "课程资料发生变化"}, max_attempts=2)
         return workspace
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -1077,6 +1111,7 @@ def delete_generic_course_material(
         workspace = delete_course_material(material_path, course_id)
         if mark_strategy_maintenance_pending(course_id, "课程资料发生变化"):
             enqueue_agent_job(course_id, "maintain_review_plan", {"event": "课程资料发生变化"})
+            enqueue_agent_job(course_id, "glossary_refresh", {"event": "课程资料发生变化"}, max_attempts=2)
         return workspace
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1090,6 +1125,7 @@ def rescan_course_materials(
         workspace = refresh_workspace_materials(course_id)
         if mark_strategy_maintenance_pending(course_id, "课程资料重新解析"):
             enqueue_agent_job(course_id, "maintain_review_plan", {"event": "课程资料重新解析"})
+            enqueue_agent_job(course_id, "glossary_refresh", {"event": "课程资料重新解析"}, max_attempts=2)
         return workspace
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1359,6 +1395,75 @@ def discover_mcp_server_tools(server_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except (RuntimeError, OSError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.get("/api/courses/{course_id}/glossary")
+def get_course_glossary(course_id: str) -> dict[str, Any]:
+    try:
+        load_workspace(course_id, refresh_materials=False)
+        return {
+            "courseId": course_id,
+            "terms": list_glossary_terms(course_id),
+            "status": get_glossary_refresh_state(course_id),
+        }
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get("/api/courses/{course_id}/glossary/status")
+def get_course_glossary_status(course_id: str) -> dict[str, Any]:
+    try:
+        load_workspace(course_id, refresh_materials=False)
+        return get_glossary_refresh_state(course_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.put("/api/courses/{course_id}/glossary/terms/{term_id}")
+def update_course_glossary_term(course_id: str, term_id: str, payload: GlossaryTermUpdateRequest) -> dict[str, Any]:
+    try:
+        fields = {key: value for key, value in payload.model_dump().items() if value is not None}
+        if not fields:
+            raise ValueError("至少需要提供一个待更新字段")
+        term = update_glossary_term_fields(course_id, term_id, fields)
+        return {
+            "courseId": course_id,
+            "term": term,
+            "status": get_glossary_refresh_state(course_id),
+        }
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.delete("/api/courses/{course_id}/glossary/terms/{term_id}")
+def delete_course_glossary_term(course_id: str, term_id: str) -> dict[str, Any]:
+    try:
+        delete_glossary_term(course_id, term_id)
+        return {
+            "courseId": course_id,
+            "terms": list_glossary_terms(course_id),
+            "status": get_glossary_refresh_state(course_id),
+        }
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.post("/api/courses/{course_id}/glossary/refresh", status_code=202)
+def refresh_course_glossary(course_id: str, payload: GlossaryRefreshRequest | None = None) -> dict[str, Any]:
+    try:
+        load_workspace(course_id, refresh_materials=False)
+        force = bool(payload.force) if payload else False
+        job_id = enqueue_agent_job(
+            course_id,
+            "glossary_refresh",
+            {"event": "手动刷新", "force": force},
+            max_attempts=2,
+        )
+        return {"jobId": job_id, "courseId": course_id}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @app.post("/api/courses/{course_id}/external-sources", status_code=202)
