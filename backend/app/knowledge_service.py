@@ -897,6 +897,43 @@ def _score_semantic_vectors(
     return scored
 
 
+def sample_material_chunks(course_id: str, *, max_characters: int = 15000) -> str:
+    """广覆盖采样课程资料文本，供 Glossary Scanner 提取术语使用。
+
+    与 retrieve_material_context 的相关度 top-K 不同：术语提取要的是「见多识广」，
+    因此按 (relative_path, chunk_index) 顺序遍历，每份材料均匀抽取片段，拼成
+    `[来源：文件名 · 定位符]` 前缀的纯文本。
+    """
+    initialize_knowledge_database()
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT material_name, locator, content FROM material_chunks "
+            "WHERE course_id = ? ORDER BY relative_path, chunk_index",
+            (course_id,),
+        ).fetchall()
+    if not rows:
+        return ""
+    per_material = max(1, max_characters // max(1, len({str(row["material_name"]) for row in rows})))
+    seen_counts: dict[str, int] = {}
+    pieces: list[str] = []
+    total = 0
+    for row in rows:
+        name = str(row["material_name"])
+        if seen_counts.get(name, 0) >= per_material:
+            continue
+        piece = str(row["content"]).strip()
+        if not piece:
+            continue
+        seen_counts[name] = seen_counts.get(name, 0) + 1
+        prefix = f"[来源：{name} · {row['locator']}]"
+        segment = f"{prefix}\n{piece}"
+        if total + len(segment) > max_characters:
+            break
+        pieces.append(segment)
+        total += len(segment)
+    return "\n\n".join(pieces)
+
+
 def retrieve_material_context(course_id: str, query: str, *, limit: int = 6) -> dict[str, Any]:
     global _EMBEDDING_UNAVAILABLE_UNTIL
     initialize_knowledge_database()
