@@ -1,4 +1,5 @@
-import { type FormEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
+import { type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Bot, Check, LoaderCircle, MessageCircle, PanelRightClose, PanelRightOpen, Send, Sparkles, X } from 'lucide-react'
 import rehypeKatex from 'rehype-katex'
 import ReactMarkdown from 'react-markdown'
@@ -6,6 +7,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import 'katex/dist/katex.min.css'
 import type { AdjustmentProposal, Course, ModelProfile, StreamingMessage, StreamingToolEvent, StudyMessage } from '../types'
+import { glossaryMarkdownComponents } from '../glossary/termMatcher'
 
 type AiCompanionProps = {
   className?: string
@@ -130,6 +132,7 @@ export function AiCompanion({
   const didInitRef = useRef(false) // 首次挂载时强制贴底一次
   const turnRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [activeTurnIdx, setActiveTurnIdx] = useState(0)
+  const [turnTooltip, setTurnTooltip] = useState<{ content: string; style: CSSProperties } | null>(null)
   const canSend = input.trim().length > 0 && !isSending
   const panelClassName = ['ai-panel', isCollapsed ? 'is-collapsed' : '', className].filter(Boolean).join(' ')
   const modeMessages = messages.filter((message) => (message.mode ?? 'chat') === mode)
@@ -172,6 +175,7 @@ export function AiCompanion({
   function handleScroll() {
     const el = scrollRef.current
     if (!el) return
+    setTurnTooltip(null)
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
     updateActiveTurn()
   }
@@ -181,6 +185,24 @@ export function AiCompanion({
     if (!node) return
     node.scrollIntoView({ behavior: 'smooth', block: 'start' })
     stickRef.current = false // 跳转后不要被后续流式增量拉回底部
+  }
+
+  function showTurnTooltip(target: HTMLButtonElement, content: string) {
+    const rect = target.getBoundingClientRect()
+    const viewportWidth = window.innerWidth
+    const viewportHeight = window.innerHeight
+    const width = Math.max(120, Math.min(260, viewportWidth - 24))
+    const left = Math.max(12, Math.min(rect.left - width - 12, viewportWidth - width - 12))
+    const top = Math.min(Math.max(12, rect.top - 14), Math.max(12, viewportHeight - 36))
+    setTurnTooltip({
+      content,
+      style: {
+        left,
+        top,
+        width,
+        maxHeight: Math.max(72, viewportHeight - top - 12),
+      },
+    })
   }
 
   // 智能粘底：首次挂载强制贴底；之后仅在用户本就贴底时跟随流式增量
@@ -248,7 +270,7 @@ export function AiCompanion({
         {renderToolEvents(sm.toolEvents)}
         <div className="chat-markdown">
           {sm.content ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+            <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={glossaryMarkdownComponents()}>
               {formatAssistantContent(sm.content)}
             </ReactMarkdown>
           ) : (
@@ -284,6 +306,7 @@ export function AiCompanion({
             <ReactMarkdown
               remarkPlugins={[remarkGfm, remarkMath]}
               rehypePlugins={[rehypeKatex]}
+              components={glossaryMarkdownComponents()}
             >
               {formatAssistantContent(message.content)}
             </ReactMarkdown>
@@ -456,8 +479,11 @@ export function AiCompanion({
                 key={message.id}
                 type="button"
                 className={['chat-turn-dot', index === activeTurnIdx ? 'is-active' : ''].filter(Boolean).join(' ')}
-                data-tooltip={message.content.slice(0, 40) + (message.content.length > 40 ? '…' : '')}
                 aria-label={`跳转到第 ${index + 1} 轮提问`}
+                onFocus={(event) => showTurnTooltip(event.currentTarget, message.content)}
+                onBlur={() => setTurnTooltip(null)}
+                onPointerEnter={(event) => showTurnTooltip(event.currentTarget, message.content)}
+                onPointerLeave={() => setTurnTooltip(null)}
                 onClick={() => jumpTo(message.id)}
               />
             ))}
@@ -476,6 +502,12 @@ export function AiCompanion({
           <Send size={17} />
         </button>
       </form>
+      {turnTooltip && createPortal(
+        <div className="chat-turn-tooltip" style={turnTooltip.style}>
+          {turnTooltip.content}
+        </div>,
+        document.body,
+      )}
     </aside>
   )
 }

@@ -7,6 +7,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { X } from 'lucide-react'
 import type { GlossaryTerm } from '../types'
+import { glossaryMarkdownComponents } from '../glossary/termMatcher'
 
 export default function GlossaryTermCard({ term, onClose }: { term: GlossaryTerm; onClose: () => void }) {
   useEffect(() => {
@@ -48,7 +49,7 @@ export default function GlossaryTermCard({ term, onClose }: { term: GlossaryTerm
           <p className="glossary-term-card-one-liner">{term.oneLiner}</p>
           {term.article ? (
             <div className="glossary-term-card-article">
-              <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+              <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={glossaryMarkdownComponents()}>
                 {term.article}
               </Markdown>
             </div>

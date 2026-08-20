@@ -3,7 +3,7 @@ import katex from 'katex'
 import 'katex/dist/katex.min.css'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { wrapTextWithTerms } from '../glossary/termMatcher'
+import { glossaryMarkdownComponents, wrapTextWithTerms } from '../glossary/termMatcher'
 import {
   ArrowRight,
   ArchiveRestore,
@@ -1674,7 +1674,7 @@ function StrategyReviewView({
           {planMode === 'edit' ? (
             <textarea className="strategy-prompt-editor" value={reviewPlan} onChange={(event) => setReviewPlan(event.target.value)} />
           ) : (
-            <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reviewPlan}</ReactMarkdown></article>
+            <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]} components={glossaryMarkdownComponents()}>{reviewPlan}</ReactMarkdown></article>
           )}
         </section>
 
@@ -1689,7 +1689,7 @@ function StrategyReviewView({
           {promptMode === 'edit' ? (
             <textarea className="strategy-prompt-editor" value={coursePrompt} onChange={(event) => setCoursePrompt(event.target.value)} />
           ) : (
-            <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{coursePrompt}</ReactMarkdown></article>
+            <article className="strategy-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]} components={glossaryMarkdownComponents()}>{coursePrompt}</ReactMarkdown></article>
           )}
         </section>
       </div>}
@@ -1790,7 +1790,7 @@ function StrategySection({
             </div>
           </header>
           <article className="strategy-markdown-preview">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{strategyDocuments.reviewPlan.content}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={glossaryMarkdownComponents()}>{strategyDocuments.reviewPlan.content}</ReactMarkdown>
           </article>
         </section>
 
@@ -1824,7 +1824,7 @@ function StrategySection({
             />
           ) : (
             <article className="strategy-markdown-preview">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={glossaryMarkdownComponents()}>
                 {coursePrompt.trim() ? coursePrompt : '（暂无课程级指令）点击右上角「编辑」可维护课程级复习指令，保存后将用于后续 AI 行为。'}
               </ReactMarkdown>
             </article>
@@ -4211,7 +4211,7 @@ function NotesView({
         ) : (
           <article className="note-markdown-preview">
             {note.trim() ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{note}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={glossaryMarkdownComponents()}>{note}</ReactMarkdown>
             ) : (
               <p className="note-empty">还没有笔记内容</p>
             )}
@@ -4615,6 +4615,7 @@ function MaterialPreviewContent({
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
+              ...glossaryMarkdownComponents(),
               a: ({ children, href }) => (
                 <a href={href} target="_blank" rel="noreferrer">
                   {children}

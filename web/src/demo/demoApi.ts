@@ -18,6 +18,7 @@ import type {
   DailyProgress,
   EmbeddingProfile,
   ExternalSource,
+  GlossaryResponse,
   KnowledgeBaseStatus,
   MaterialPreview,
   McpServer,
@@ -35,6 +36,7 @@ import type {
   UserProfilePrompt,
 } from '../types'
 import { fillScriptPlaceholders, matchAgentScript } from './scripts'
+import * as localApi from '../api'
 
 /* ------------------------------------------------------------------ */
 /* 内部类型：api.ts 的私有响应类型在此声明结构等价版本（快照即后端原样 JSON） */
@@ -73,6 +75,13 @@ type CourseMindMapApiResponse = {
   mindMap: CourseMindMap | null
 }
 
+/** 快照中的 glossary 响应（后端原标 JSON：camelCase term + snake_case 字段，api.ts toGlossaryTerm 负责转换） */
+type GlossaryApiResponse = {
+  courseId: string
+  terms: localApi.GlossaryTermApiResponse[]
+  status: Partial<localApi.GlossaryStatusApiResponse>
+}
+
 type ApiSurface = typeof import('../api')
 
 /* ------------------------------------------------------------------ */
@@ -86,6 +95,7 @@ type DemoSnapshot = {
   strategyDocuments: Record<string, StrategyDocuments>
   knowledgeStatus: Record<string, KnowledgeBaseStatus>
   materialPreviews: Record<string, Record<string, MaterialPreview>>
+  glossaries?: Record<string, GlossaryApiResponse>
   archive: ArchiveItemApiResponse[]
   runtimeModel: RuntimeModel
   userProfile: UserProfilePrompt
@@ -584,6 +594,47 @@ const demoApi: ApiSurface = {
 
   async getAgentJob(jobId) {
     return getJob(jobId)
+  },
+
+  /* ---------------- 术语词条 ---------------- */
+
+  async getCourseGlossary(courseId) {
+    const data = await loadSnapshot()
+    return toGlossaryResponse(courseId, data.glossaries?.[courseId])
+  },
+
+  async getCourseGlossaryStatus(courseId) {
+    const data = await loadSnapshot()
+    return toGlossaryResponse(courseId, data.glossaries?.[courseId]).status
+  },
+
+  async refreshCourseGlossary(courseId) {
+    await loadSnapshot()
+    return { jobId: registerJob(courseId, 'glossary_refresh'), courseId }
+  },
+
+  async updateGlossaryTerm(courseId, termId, fields) {
+    const data = await loadSnapshot()
+    const entry = mutableGlossaryEntry(data, courseId)
+    const target = entry.terms.find((item) => item.id === termId)
+    if (!target) throw new Error('词条不存在')
+    if (fields.term !== undefined) target.term = fields.term
+    if (fields.aliases !== undefined) target.aliases = fields.aliases
+    if (fields.oneLiner !== undefined) target.oneLiner = fields.oneLiner
+    if (fields.article !== undefined) target.article = fields.article
+    if (fields.examTips !== undefined) target.examTips = fields.examTips
+    if (fields.pitfalls !== undefined) target.pitfalls = fields.pitfalls
+    if (fields.importance !== undefined) target.importance = fields.importance
+    if (fields.status !== undefined) target.status = fields.status
+    target.updatedAt = nowIso()
+    return localApi.toGlossaryTerm(target)
+  },
+
+  async deleteGlossaryTerm(courseId, termId) {
+    const data = await loadSnapshot()
+    const entry = mutableGlossaryEntry(data, courseId)
+    entry.terms = entry.terms.filter((item) => item.id !== termId)
+    return toGlossaryResponse(courseId, entry)
   },
 
   async saveCoursePrompt(courseId, coursePrompt, version) {
@@ -1199,11 +1250,48 @@ const demoApi: ApiSurface = {
       statusMessage: runtimeModel.connected ? '已由本机服务配置并连接' : '本机模型尚未配置',
     }
   },
+
+  /** 纯转换函数：直接复用真实实现，保证 demo 与本地后端形状一致。 */
+  toGlossaryTerm: localApi.toGlossaryTerm,
+  toGlossaryStatus: localApi.toGlossaryStatus,
 }
 
 async function decoratedWorkspaceAsync(courseId: string): Promise<StudyWorkspace> {
   await loadSnapshot()
   return decoratedWorkspace(courseId)
+}
+
+/* ------------------------------------------------------------------ */
+/* 术语词条辅助（快照 glossaries 可选，缺失时返回空表） */
+
+function toGlossaryResponse(courseId: string, entry: GlossaryApiResponse | undefined): GlossaryResponse {
+  const terms = (entry?.terms ?? []).map(localApi.toGlossaryTerm)
+  const statusResponse = entry?.status ?? {}
+  return {
+    courseId,
+    terms,
+    status: localApi.toGlossaryStatus(courseId, {
+      courseId,
+      status: statusResponse.status ?? 'idle',
+      termsTotal: statusResponse.termsTotal ?? terms.length,
+      termsActive: statusResponse.termsActive ?? terms.filter((term) => term.status === 'active').length,
+      lastError: statusResponse.lastError ?? '',
+      lastRefreshedAt: statusResponse.lastRefreshedAt ?? '',
+    }),
+  }
+}
+
+function mutableGlossaryEntry(data: DemoSnapshot, courseId: string): GlossaryApiResponse {
+  if (!data.glossaries) data.glossaries = {}
+  const existing = data.glossaries[courseId]
+  if (existing) return existing
+  const created: GlossaryApiResponse = {
+    courseId,
+    terms: [],
+    status: { status: 'idle', termsTotal: 0, termsActive: 0, lastError: '', lastRefreshedAt: '' },
+  }
+  data.glossaries[courseId] = created
+  return created
 }
 
 /* ------------------------------------------------------------------ */
@@ -1213,12 +1301,12 @@ type DemoJob = AgentJob & { startedAtMs: number }
 
 const jobs = new Map<string, DemoJob>()
 
-function registerJob(courseId: string): string {
+function registerJob(courseId: string, jobType: AgentJob['jobType'] = 'strategy_documents_approve'): string {
   const id = `job-demo-${Date.now()}`
   jobs.set(id, {
     id,
     courseId,
-    jobType: 'strategy_documents_approve',
+    jobType,
     status: 'queued',
     attempts: 1,
     maxAttempts: 3,

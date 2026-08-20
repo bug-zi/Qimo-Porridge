@@ -10,13 +10,14 @@ import {
   type ReactNode,
 } from 'react'
 import type { GlossaryStatus, GlossaryTerm } from '../types'
-import { getAgentJob, getCourseGlossary } from '../apiClient'
+import { getAgentJob, getCourseGlossary, refreshCourseGlossary } from '../apiClient'
 import { clearGlossaryTerms, setActiveGlossaryTerms } from '../glossary/termMatcher'
 import GlossaryTermCard from '../components/GlossaryTermCard'
 
 type GlossaryContextValue = {
   terms: GlossaryTerm[]
   status: GlossaryStatus | null
+  activeTermId: string | null
   openTerm: (termId: string) => void
   closeTerm: () => void
   refresh: () => Promise<void>
@@ -28,7 +29,7 @@ export function useGlossary(): GlossaryContextValue {
   const context = useContext(GlossaryContext)
   if (!context) {
     // FormulaText 在 React 树内被渲染时必然处于 Provider 之下；防御性兜底
-    return { terms: [], status: null, openTerm: () => {}, closeTerm: () => {}, refresh: async () => {} }
+    return { terms: [], status: null, activeTermId: null, openTerm: () => {}, closeTerm: () => {}, refresh: async () => {} }
   }
   return context
 }
@@ -72,7 +73,6 @@ export function GlossaryProvider({ courseId, children }: { courseId: string | nu
   const refresh = useCallback(async () => {
     if (!courseId || glossaryJobId) return
     try {
-      const { refreshCourseGlossary } = await import('../apiClient')
       const { jobId } = await refreshCourseGlossary(courseId)
       setGlossaryJobId(jobId)
       const poll = window.setInterval(async () => {
@@ -102,8 +102,8 @@ export function GlossaryProvider({ courseId, children }: { courseId: string | nu
   const activeTerm = useMemo(() => terms.find((term) => term.id === activeTermId) ?? null, [terms, activeTermId])
 
   const value = useMemo(
-    () => ({ terms, status, openTerm, closeTerm, refresh }),
-    [terms, status, openTerm, closeTerm, refresh],
+    () => ({ terms, status, activeTermId, openTerm, closeTerm, refresh }),
+    [terms, status, activeTermId, openTerm, closeTerm, refresh],
   )
 
   return (

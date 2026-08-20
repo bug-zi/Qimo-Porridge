@@ -788,7 +788,7 @@ export function toRuntimeModelProfile(
   }
 }
 
-type GlossaryTermApiResponse = {
+export type GlossaryTermApiResponse = {
   id: string
   term: string
   matchKey?: string
@@ -806,7 +806,7 @@ type GlossaryTermApiResponse = {
   updatedAt?: string
 }
 
-type GlossaryStatusApiResponse = {
+export type GlossaryStatusApiResponse = {
   courseId: string
   status: 'idle' | 'generating' | 'ready' | 'failed'
   termsTotal: number
@@ -815,7 +815,7 @@ type GlossaryStatusApiResponse = {
   lastRefreshedAt: string
 }
 
-function toGlossaryTerm(response: GlossaryTermApiResponse): GlossaryTerm {
+export function toGlossaryTerm(response: GlossaryTermApiResponse): GlossaryTerm {
   return {
     id: response.id,
     term: response.term,
@@ -834,7 +834,7 @@ function toGlossaryTerm(response: GlossaryTermApiResponse): GlossaryTerm {
   }
 }
 
-function toGlossaryStatus(courseId: string, response: GlossaryStatusApiResponse): GlossaryStatus {
+export function toGlossaryStatus(courseId: string, response: GlossaryStatusApiResponse): GlossaryStatus {
   return {
     courseId,
     status: response.status ?? 'idle',

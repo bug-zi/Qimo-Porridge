@@ -54,6 +54,7 @@ import type {
   WrongAnswer,
 } from '../types'
 import { generateCourseMindMap, getCourseMindMap, regroupCourseMindMapModules, saveCourseMindMap } from '../apiClient'
+import { glossaryMarkdownComponents } from '../glossary/termMatcher'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -1313,7 +1314,7 @@ function KnowledgeDetailPanel({
                   </header>
                   {point.explanation && (
                     <div className="mind-map-detail-md">
-                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={glossaryMarkdownComponents()}>
                         {point.explanation}
                       </ReactMarkdown>
                     </div>
@@ -1344,7 +1345,7 @@ function KnowledgeDetailPanel({
                   <strong>{concept.title}</strong>
                   {concept.body && (
                     <div className="mind-map-detail-md">
-                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={glossaryMarkdownComponents()}>
                         {concept.body}
                       </ReactMarkdown>
                     </div>
@@ -1369,7 +1370,7 @@ function KnowledgeDetailPanel({
                   </header>
                   {example.problem && (
                     <div className="mind-map-detail-md mind-map-detail-example-problem">
-                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={glossaryMarkdownComponents()}>
                         {example.problem}
                       </ReactMarkdown>
                     </div>

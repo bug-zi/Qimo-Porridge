@@ -166,6 +166,9 @@ def main() -> int:
         knowledge = api_get(base_url, f"/api/courses/{course_id}/knowledge/status")
         snapshot["knowledgeStatus"][course_id] = knowledge
 
+        glossary = api_get(base_url, f"/api/courses/{course_id}/glossary")
+        snapshot.setdefault("glossaries", {})[course_id] = glossary
+
         preview_map: dict[str, dict] = {}
         for material in workspace.get("materials") or []:
             relative_path = material.get("relativePath")

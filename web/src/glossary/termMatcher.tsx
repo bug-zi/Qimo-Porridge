@@ -5,7 +5,7 @@
  * 因此术语表通过 setActiveGlossaryTerms 直接注册到本模块，Provider 在课程加载时调用。
  */
 import type { ReactNode } from 'react'
-import { createElement } from 'react'
+import { cloneElement, createElement, isValidElement, type ReactElement } from 'react'
 import type { GlossaryTerm } from '../types'
 import GlossaryTermSpan from '../components/GlossaryTermSpan'
 
@@ -120,14 +120,15 @@ export function wrapMarkdownChildren(children: ReactNode, keyPrefix = 'md'): Rea
     return children.map((child, index) => wrapMarkdownChildren(child, `${keyPrefix}-${index}`))
   }
   if (children && typeof children === 'object' && 'type' in children) {
-    const node = children as { type?: unknown; props?: { className?: unknown; children?: unknown } }
-    if (typeof node.type === 'string' && SKIP_ELEMENTS.has(node.type)) return children
+    if (!isValidElement(children)) return children
+    if (typeof children.type === 'string' && SKIP_ELEMENTS.has(children.type)) return children
     if (isKatexNode(children)) return children
-    const childChildren = node.props?.children
+    const element = children as ReactElement<{ children?: unknown }>
+    const childChildren = element.props.children
     if (childChildren === undefined || childChildren === null) return children
     const wrapped = wrapMarkdownChildren(childChildren as ReactNode, `${keyPrefix}-child`)
     if (wrapped === childChildren) return children
-    return { ...node, props: { ...node.props, children: wrapped } }
+    return cloneElement(element, undefined, wrapped)
   }
   return children
 }
