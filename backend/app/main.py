@@ -47,15 +47,22 @@ from .knowledge_service import (
     save_embedding_config,
     test_embedding_connection,
 )
-from .mcp_gateway import discover_mcp_tools, list_mcp_servers, save_mcp_server, seed_mcp_presets
+from .mcp_gateway import (
+    clear_bilibili_credentials,
+    discover_mcp_tools,
+    get_bilibili_credential_status,
+    list_mcp_servers,
+    save_bilibili_credentials,
+    save_mcp_server,
+    seed_mcp_presets,
+    verify_bilibili_credentials,
+)
 from .study_service import (
     agent_chat,
     agent_chat_stream,
     approve_strategy_documents,
     build_material_preview,
-    bootstrap_engineering_workspace,
     create_course_workspace,
-    create_empty_course_workspace,
     fetch_available_model_ids,
     generate_strategy_documents,
     generate_mind_map,
@@ -69,6 +76,7 @@ from .study_service import (
     mark_strategy_maintenance_pending,
     clear_practice_answer,
     clear_mock_result,
+    ensure_orientation_task,
     refresh_workspace_materials,
     regroup_course_modules,
     resolve_course_material_path,
@@ -85,7 +93,6 @@ from .study_service import (
     submit_practice_answer,
     submit_wrong_answer_retry,
     sync_course_knowledge,
-    upload_course_material,
     upload_course_materials,
     update_workspace_state,
     update_course_prompt,
@@ -147,6 +154,13 @@ def _glossary_refresh_job(course_id: str, payload: dict[str, Any]) -> dict[str, 
     )
 
 
+def _orientation_refresh_job(course_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # 主线重排/参数变更后重建第0天·复习导引：build_orientation_guide 按模块+知识点
+    # 签名缓存，内容未变时零成本命中，变化时走 LLM 重生成，失败时确定性兜底。
+    ensure_orientation_task(course_id, force=True)
+    return {"refreshed": True}
+
+
 AGENT_JOB_WORKER = AgentJobWorker(
     {
         "maintain_review_plan": _maintain_plan_job,
@@ -154,6 +168,7 @@ AGENT_JOB_WORKER = AgentJobWorker(
         "approve_strategy_documents": _approve_strategy_documents_job,
         "rebalance_daily_plan": _rebalance_plan_job,
         "glossary_refresh": _glossary_refresh_job,
+        "orientation_refresh": _orientation_refresh_job,
     }
 )
 
@@ -349,11 +364,6 @@ class EmbeddingConfigRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
 
 
-class EngineeringBootstrapRequest(BaseModel):
-    force: bool = False
-    target_score: int = Field(default=80, ge=60, le=100)
-    daily_hours: float = Field(default=2, gt=0, le=12)
-    days: int = Field(default=3, ge=1, le=14)
 
 
 class CourseSetupRequest(BaseModel):
@@ -432,6 +442,12 @@ class McpServerUpdateRequest(BaseModel):
     command: str = Field(default="", max_length=300)
     args: list[str] = Field(default_factory=list, max_length=20)
     allowed_tools: list[str] = Field(min_length=1, max_length=40)
+
+
+class BilibiliCredentialsRequest(BaseModel):
+    sessdata: str = Field(min_length=1, max_length=512)
+    bili_jct: str = Field(min_length=1, max_length=64)
+    dedeuserid: str = Field(min_length=1, max_length=32)
 
 
 class ExternalSourceRequest(BaseModel):
@@ -1333,6 +1349,14 @@ def apply_course_adjustment_proposal(course_id: str, proposal_id: str) -> dict[s
                 )
         if mark_strategy_maintenance_pending(course_id, "用户确认调整复习计划"):
             enqueue_agent_job(course_id, "maintain_review_plan", {"event": "用户确认调整复习计划"})
+        # 主线重排（restructure_modules）或参数变更（replan 类提案）被采纳后，
+        # 第0天·复习导引的阶段划分/依赖分层可能已过时，异步重建（签名缓存兜底，内容未变时零成本）。
+        touches_mainline = bool(proposal.get("params")) or any(
+            str(operation.get("type", "")) == "restructure_modules"
+            for operation in proposal.get("operations", [])
+        )
+        if touches_mainline:
+            enqueue_agent_job(course_id, "orientation_refresh", {"event": "提案被采纳"}, max_attempts=1)
         return {"workspace": workspace, "proposal": proposal}
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1395,6 +1419,32 @@ def discover_mcp_server_tools(server_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except (RuntimeError, OSError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.get("/api/mcp/bilibili/credentials")
+def bilibili_credentials_status() -> dict[str, Any]:
+    return get_bilibili_credential_status()
+
+
+@app.get("/api/mcp/bilibili/credentials/verify")
+def bilibili_credentials_verify() -> dict[str, Any]:
+    try:
+        return verify_bilibili_credentials()
+    except (RuntimeError, OSError, ValueError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.put("/api/mcp/bilibili/credentials")
+def save_bilibili_credentials_endpoint(payload: BilibiliCredentialsRequest) -> dict[str, Any]:
+    try:
+        return save_bilibili_credentials(payload.sessdata, payload.bili_jct, payload.dedeuserid)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.delete("/api/mcp/bilibili/credentials")
+def clear_bilibili_credentials_endpoint() -> dict[str, Any]:
+    return clear_bilibili_credentials()
 
 
 @app.get("/api/courses/{course_id}/glossary")
@@ -1550,7 +1600,7 @@ def archive_course(course_id: str) -> ArchiveItemResponse:
             return archive_item
 
     try:
-        workspace = load_workspace()
+        workspace = load_workspace(course_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="课程不存在") from error
 
@@ -1566,26 +1616,17 @@ def archive_course(course_id: str) -> ArchiveItemResponse:
             title=workspace_course.get("name", "未命名课程"),
             course_id=course_id,
             course_name=workspace_course.get("name"),
-            payload={
-                "storage": "workspace",
-                "workspace": workspace,
-            },
+            payload={"storage": "workspace", "workspace": workspace},
         )
-        workspace["course"] = {
-            **workspace_course,
-            "archivedAt": archive_item.deleted_at,
-        }
-        save_workspace(workspace)
+        workspace["course"] = {**workspace_course, "archivedAt": archive_item.deleted_at}
+        save_workspace(workspace, course_id)
     return archive_item
 
 
 @app.get("/api/courses/{course_id}/plan", response_model=list[PlanTaskResponse])
 def get_course_plan(course_id: str) -> list[PlanTaskResponse]:
     with get_connection() as connection:
-        course = connection.execute(
-            "SELECT id FROM courses WHERE id = ?",
-            (course_id,),
-        ).fetchone()
+        course = connection.execute("SELECT id FROM courses WHERE id = ?", (course_id,)).fetchone()
         if course is None:
             raise HTTPException(status_code=404, detail="课程不存在")
         rows = connection.execute(
@@ -1609,10 +1650,7 @@ def test_model_profile(payload: ModelProfileTestRequest) -> ModelProfileTestResp
 
     api_key = payload.api_key.strip() or get_runtime_model_api_key()
     if not api_key:
-        return ModelProfileTestResponse(
-            success=False,
-            message="请先填写 API Key 或保存本机 API Key",
-        )
+        return ModelProfileTestResponse(success=False, message="请先填写 API Key 或保存本机 API Key")
 
     try:
         available_models = fetch_available_model_ids(base_url, api_key)
@@ -1625,31 +1663,15 @@ def test_model_profile(payload: ModelProfileTestRequest) -> ModelProfileTestResp
             )
         model_count = len(available_models)
         message = f"连接成功，已读取 {model_count} 个可用模型" if model_count else "连接成功，但未读取到可用模型列表"
-        return ModelProfileTestResponse(
-            success=True,
-            message=message,
-            available_models=available_models,
-        )
+        return ModelProfileTestResponse(success=True, message=message, available_models=available_models)
     except HTTPError as error:
-        return ModelProfileTestResponse(
-            success=False,
-            message=f"模型服务返回 HTTP {error.code}，请检查 API Key 和服务地址",
-        )
+        return ModelProfileTestResponse(success=False, message=f"模型服务返回 HTTP {error.code}，请检查 API Key 和服务地址")
     except URLError:
-        return ModelProfileTestResponse(
-            success=False,
-            message="无法连接模型服务，请检查 Base URL、网络或本地代理",
-        )
+        return ModelProfileTestResponse(success=False, message="无法连接模型服务，请检查 Base URL、网络或本地代理")
     except TimeoutError:
-        return ModelProfileTestResponse(
-            success=False,
-            message="连接超时，请检查服务是否可用",
-        )
+        return ModelProfileTestResponse(success=False, message="连接超时，请检查服务是否可用")
     except ValueError:
-        return ModelProfileTestResponse(
-            success=False,
-            message="模型服务返回内容无法解析，请确认 /models 接口兼容 OpenAI 格式",
-        )
+        return ModelProfileTestResponse(success=False, message="模型服务返回内容无法解析，请确认 /models 接口兼容 OpenAI 格式")
 
 
 @app.get("/api/runtime-model")
@@ -1681,11 +1703,6 @@ def update_user_profile_prompt(payload: UserProfilePromptUpdateRequest) -> dict[
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 
-@app.get("/api/knowledge/status")
-def knowledge_status() -> dict[str, Any]:
-    return get_knowledge_status("engineering-economics")
-
-
 @app.get("/api/courses/{course_id}/knowledge/status")
 def course_knowledge_status(course_id: str) -> dict[str, Any]:
     return get_knowledge_status(course_id)
@@ -1708,13 +1725,7 @@ def embedding_status() -> dict[str, Any]:
 @app.put("/api/knowledge/embedding")
 def update_embedding_config(payload: EmbeddingConfigRequest) -> dict[str, Any]:
     try:
-        return save_embedding_config(
-            {
-                "enabled": payload.enabled,
-                "baseUrl": payload.base_url,
-                "model": payload.model,
-            }
-        )
+        return save_embedding_config({"enabled": payload.enabled, "baseUrl": payload.base_url, "model": payload.model})
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -1723,312 +1734,3 @@ def update_embedding_config(payload: EmbeddingConfigRequest) -> dict[str, Any]:
 def test_saved_embedding() -> dict[str, Any]:
     return test_embedding_connection()
 
-
-@app.post("/api/knowledge/embedding/reindex")
-def reindex_knowledge() -> dict[str, Any]:
-    try:
-        sync_course_knowledge("engineering-economics")
-        return rebuild_course_embeddings("engineering-economics")
-    except (RuntimeError, HTTPError, URLError, TimeoutError, OSError) as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-
-
-@app.get("/api/engineering-economics/workspace")
-def engineering_workspace() -> dict[str, Any]:
-    try:
-        return load_workspace()
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/setup/draft")
-def create_engineering_draft_workspace() -> dict[str, Any]:
-    return create_empty_course_workspace()
-
-
-@app.post("/api/engineering-economics/setup")
-def save_engineering_course_setup(payload: CourseSetupRequest) -> dict[str, Any]:
-    try:
-        return save_course_setup(payload.model_dump())
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/diagnostic/submit")
-def submit_engineering_course_diagnostic(payload: DiagnosticSubmitRequest) -> dict[str, Any]:
-    try:
-        return submit_course_diagnostic(payload.answers)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-
-
-@app.get("/api/engineering-economics/materials/preview/{material_path:path}")
-def preview_engineering_material(material_path: str) -> dict[str, Any]:
-    try:
-        return build_material_preview(material_path)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.get("/api/engineering-economics/materials/file/{material_path:path}")
-def open_engineering_material(material_path: str) -> FileResponse:
-    try:
-        file_path = resolve_course_material_path(material_path)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    return FileResponse(
-        file_path,
-        media_type=media_type,
-        filename=file_path.name,
-        content_disposition_type="inline",
-    )
-
-
-@app.get("/api/engineering-economics/materials/converted-file/{material_path:path}")
-def open_converted_engineering_material(material_path: str) -> FileResponse:
-    try:
-        file_path = resolve_converted_material_pdf_path(material_path)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-    return FileResponse(
-        file_path,
-        media_type="application/pdf",
-        filename=f"{Path(material_path).stem}.pdf",
-        content_disposition_type="inline",
-    )
-
-
-@app.post("/api/engineering-economics/materials/upload")
-async def upload_engineering_material(filename: str, request: FastAPIRequest) -> dict[str, Any]:
-    try:
-        content = await request.body()
-        return upload_course_material(filename, content)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/materials/upload-batch")
-async def upload_engineering_material_batch(request: FastAPIRequest) -> dict[str, Any]:
-    try:
-        payload = await request.body()
-        header_end = payload.find(b"\n")
-        if header_end <= 0:
-            raise ValueError("批量上传数据格式无效")
-        manifest_length = int(payload[:header_end].decode("ascii"))
-        manifest_start = header_end + 1
-        manifest_end = manifest_start + manifest_length
-        manifest = json.loads(payload[manifest_start:manifest_end].decode("utf-8"))
-        if not isinstance(manifest, list):
-            raise ValueError("批量上传清单格式无效")
-
-        files: list[tuple[str, bytes]] = []
-        offset = manifest_end
-        for item in manifest:
-            if not isinstance(item, dict):
-                raise ValueError("批量上传清单格式无效")
-            filename = item.get("name")
-            size = item.get("size")
-            if not isinstance(filename, str) or not isinstance(size, int) or size < 0:
-                raise ValueError("批量上传清单字段无效")
-            next_offset = offset + size
-            if next_offset > len(payload):
-                raise ValueError("批量上传文件内容不完整")
-            files.append((filename, payload[offset:next_offset]))
-            offset = next_offset
-        if offset != len(payload):
-            raise ValueError("批量上传数据长度不匹配")
-        return upload_course_materials(files)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.delete("/api/engineering-economics/materials/{material_path:path}")
-def delete_engineering_material(material_path: str) -> dict[str, Any]:
-    try:
-        return delete_course_material(material_path)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/materials/rescan")
-def rescan_engineering_materials() -> dict[str, Any]:
-    try:
-        return refresh_workspace_materials(force_reparse=True)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.put("/api/engineering-economics/workspace")
-def update_engineering_workspace(payload: WorkspaceUpdateRequest) -> dict[str, Any]:
-    try:
-        return update_workspace_state(
-            tasks=payload.tasks,
-            wrong_answers=payload.wrong_answers,
-            note=payload.note,
-        )
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.delete(
-    "/api/engineering-economics/wrong-answers/{wrong_answer_id}",
-    response_model=WrongAnswerArchiveResponse,
-)
-def archive_wrong_answer(wrong_answer_id: str) -> WrongAnswerArchiveResponse:
-    return _archive_course_wrong_answer("engineering-economics", wrong_answer_id)
-
-
-@app.get("/api/archive", response_model=list[ArchiveItemResponse])
-def list_archive() -> list[ArchiveItemResponse]:
-    with get_connection() as connection:
-        return list_active_archive_items(connection)
-
-
-@app.post("/api/archive/{archive_id}/restore")
-def restore_archive_item(archive_id: str) -> dict[str, Any]:
-    with get_connection() as connection:
-        purge_expired_archive_items(connection)
-        row = connection.execute(
-            "SELECT * FROM archived_items WHERE id = ?",
-            (archive_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="归档内容不存在或已超过 7 天")
-
-        payload = json.loads(row["payload"])
-        item_type = row["item_type"]
-        if item_type == "course":
-            if payload.get("storage") == "workspace":
-                workspace = payload["workspace"]
-                restored_course_id = str(workspace.get("course", {}).get("id", ""))
-                save_workspace(workspace, restored_course_id)
-                course = course_payload_to_response(workspace["course"])
-                connection.execute("DELETE FROM archived_items WHERE id = ?", (archive_id,))
-                return {
-                    "item_type": item_type,
-                    "course": course.model_dump(),
-                    "workspace": workspace,
-                    "archive_items": [item.model_dump() for item in list_active_archive_items(connection)],
-                }
-
-            course_payload = payload["course"]
-            connection.execute(
-                """
-                INSERT OR REPLACE INTO courses (
-                    id, name, exam_date, target_score, daily_hours, progress, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    course_payload["id"],
-                    course_payload["name"],
-                    course_payload["exam_date"],
-                    course_payload["target_score"],
-                    course_payload["daily_hours"],
-                    course_payload.get("progress", 0),
-                    course_payload.get("created_at", datetime.now().isoformat(timespec="seconds")),
-                ),
-            )
-            connection.execute("DELETE FROM plan_tasks WHERE course_id = ?", (course_payload["id"],))
-            connection.executemany(
-                """
-                INSERT OR REPLACE INTO plan_tasks (
-                    id, course_id, title, duration, progress, priority, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        task["id"],
-                        task["course_id"],
-                        task["title"],
-                        task["duration"],
-                        task.get("progress", 0),
-                        task["priority"],
-                        task["status"],
-                    )
-                    for task in payload.get("planTasks", [])
-                ],
-            )
-            connection.execute("DELETE FROM archived_items WHERE id = ?", (archive_id,))
-            return {
-                "item_type": item_type,
-                "course": course_payload_to_response(course_payload).model_dump(),
-                "archive_items": [item.model_dump() for item in list_active_archive_items(connection)],
-            }
-
-        if item_type == "wrong-answer":
-            course_id = str(row["course_id"] or "")
-            if not course_id:
-                raise HTTPException(status_code=422, detail="归档错题缺少课程信息")
-            try:
-                workspace = load_workspace(course_id)
-            except FileNotFoundError as error:
-                raise HTTPException(status_code=404, detail=str(error)) from error
-
-            wrong_answer = payload["wrongAnswer"]
-            wrong_answers = workspace.setdefault("wrongAnswers", [])
-            if not any(item.get("id") == wrong_answer.get("id") for item in wrong_answers):
-                workspace["wrongAnswers"] = [wrong_answer, *wrong_answers]
-            save_workspace(workspace, course_id)
-            connection.execute("DELETE FROM archived_items WHERE id = ?", (archive_id,))
-            return {
-                "item_type": item_type,
-                "workspace": workspace,
-                "archive_items": [item.model_dump() for item in list_active_archive_items(connection)],
-            }
-
-    raise HTTPException(status_code=422, detail="归档类型暂不支持恢复")
-
-
-@app.post("/api/engineering-economics/bootstrap")
-def bootstrap_engineering(
-    payload: EngineeringBootstrapRequest,
-) -> dict[str, Any]:
-    if payload.target_score != 80 or payload.daily_hours != 2 or payload.days != 3:
-        raise HTTPException(
-            status_code=422,
-            detail="当前工程经济学冲刺方案固定为 3 天、每天 2 小时、目标 80+",
-        )
-    return bootstrap_engineering_workspace(force=payload.force)
-
-
-@app.post("/api/engineering-economics/practice/answer")
-def answer_engineering_practice(payload: PracticeAnswerRequest) -> dict[str, Any]:
-    try:
-        return submit_practice_answer(payload.question_id, payload.answer_index, payload.mode)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/wrong-answers/{wrong_answer_id}/retry")
-def retry_engineering_wrong_answer(wrong_answer_id: str, payload: WrongAnswerRetryRequest) -> dict[str, Any]:
-    try:
-        return submit_wrong_answer_retry(wrong_answer_id, payload.answer_index)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/mock/submit")
-def submit_engineering_mock(payload: MockSubmitRequest) -> dict[str, Any]:
-    try:
-        return submit_mock_answers(payload.answers)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/engineering-economics/agent/chat")
-def chat_with_engineering_agent(payload: AgentChatRequest) -> dict[str, Any]:
-    try:
-        return agent_chat(payload.message.strip())
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error

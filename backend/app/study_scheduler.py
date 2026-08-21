@@ -15,6 +15,30 @@ PREREQUISITE_EDGE_LABEL = "前置"
 # 无任务知识点判定"已完成"的掌握度阈值（与思维导图"薄弱<60"口径同源）。
 KP_MASTERY_DONE_THRESHOLD = 60
 FROZEN_STATUSES = ("completed", "in-progress")
+# 第0天·复习导引任务标记：不挂知识点、不占每日预算、不参与调度/顺延/逾期，
+# 永远以 (day=0, order=0) 置顶。
+ORIENTATION_TASK_KIND = "orientation"
+ORIENTATION_TASK_DAY = 0
+
+
+def is_orientation(task: object) -> bool:
+    """判断任务是否为第0天·复习导引任务。"""
+    return isinstance(task, dict) and str(task.get("kind", "")) == ORIENTATION_TASK_KIND
+
+
+def split_orientation(tasks: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把导引任务从普通任务中拆出；返回 (导引任务列表, 其余任务列表)。"""
+    orientation = [task for task in tasks if is_orientation(task)]
+    rest = [task for task in tasks if not is_orientation(task)]
+    return orientation, rest
+
+
+def _reset_orientation(orientation: list[dict]) -> None:
+    """导引任务统一复位为 (day=0, order=0)，清掉调度器痕迹。"""
+    for task in orientation:
+        task["day"] = ORIENTATION_TASK_DAY
+        task["order"] = 0
+        task.pop("schedulingReason", None)
 
 
 def _as_int(value: object, default: int) -> int:
@@ -160,8 +184,14 @@ def _find_cycle(points: list[dict]) -> list[str] | None:
 def topological_rank(points: list[dict], modules: list[dict] | None = None) -> dict[str, int]:
     """kp_id → 全局拓扑序号 0..N-1。
 
-    layer(X) = 1 + max(layer(P) for P in prerequisites(X))（记忆化 DFS，入参应已无环）。
-    层内排序键 (difficulty 升序, weight 降序, mastery 升序, module.order, 原始下标)。
+    两种排序模式：
+
+    - 模块主线模式（modules 提供且依赖方向兼容）：按模块 order 分块排主线，
+      模块内部按 layer（layer(X) = 1 + max(layer(P) for P in prerequisites(X))）+
+      层内排序键排。兼容判定：任何依赖边都不能从"靠后的模块"指回"靠前的模块"，
+      即 P 的模块 order 必须 <= X 的模块 order（无模块知识点视为最后，不挡路）。
+    - 全局分层模式（无 modules 或存在跨模块回边）：全部知识点统一按 layer 分层，
+      层内排序键 (difficulty 升序, weight 降序, mastery 升序, module.order, 原始下标)。
     """
     point_by_id = {
         str(point.get("id", "")): point
@@ -208,12 +238,38 @@ def topological_rank(points: list[dict], modules: list[dict] | None = None) -> d
             index_by_id.get(pid, 9999),
         )
 
-    layers: dict[int, list[str]] = {}
-    for pid in point_by_id:
-        layers.setdefault(layer_of(pid, set()), []).append(pid)
+    def no_module(pid: str) -> int:
+        # 无模块知识点的模块序视为 +∞：不挡任何模块的路，也不参与主线分块。
+        return module_order.get(str(point_by_id.get(pid, {}).get("moduleId") or ""), len(module_order) + 1)
+
+    # 模块主线兼容判定：不存在 P(模块序大) → X(模块序小) 的回边。
+    mainline_compatible = bool(module_order) and not any(
+        prereq in point_by_id
+        and point_by_id[prereq].get("moduleId") in module_order
+        and point.get("moduleId") in module_order
+        and module_order[str(point_by_id[prereq].get("moduleId"))] > module_order[str(point.get("moduleId"))]
+        for point in point_by_id.values()
+        for prereq in (point.get("prerequisites") or [])
+    )
+
     ordered_ids: list[str] = []
-    for layer in sorted(layers):
-        ordered_ids.extend(sorted(layers[layer], key=in_layer_key))
+    if mainline_compatible:
+        # 模块主线：模块 order 升序分块；块内 layer 分层 + 层内键。
+        blocks: dict[int, list[str]] = {}
+        for pid in point_by_id:
+            blocks.setdefault(no_module(pid), []).append(pid)
+        for module_seq in sorted(blocks):
+            by_layer: dict[int, list[str]] = {}
+            for pid in blocks[module_seq]:
+                by_layer.setdefault(layer_of(pid, set()), []).append(pid)
+            for layer in sorted(by_layer):
+                ordered_ids.extend(sorted(by_layer[layer], key=in_layer_key))
+    else:
+        layers: dict[int, list[str]] = {}
+        for pid in point_by_id:
+            layers.setdefault(layer_of(pid, set()), []).append(pid)
+        for layer in sorted(layers):
+            ordered_ids.extend(sorted(layers[layer], key=in_layer_key))
     return {pid: rank for rank, pid in enumerate(ordered_ids)}
 
 
@@ -301,6 +357,9 @@ def schedule_tasks(
         session_days = [1]
     daily_minutes = max(30, int(daily_minutes or 0) or 120)
 
+    # 导引任务不参与装箱，最终以 (day=0, order=0) 置顶。
+    orientation, rest = split_orientation(tasks)
+
     point_by_id = {
         str(point.get("id", "")): point
         for point in points
@@ -311,7 +370,7 @@ def schedule_tasks(
     remaining_capacity = {day: daily_minutes for day in session_days}
     placed: dict[int, list[dict]] = {day: [] for day in session_days}
 
-    for task in _tasks_by_kp_in_order(tasks, kp_order):
+    for task in _tasks_by_kp_in_order(rest, kp_order):
         duration = max(5, _as_int(task.get("duration"), 60))
         target_day = next(
             (
@@ -348,26 +407,30 @@ def schedule_tasks(
             task["order"] = order_index
             order_index += 1
             sorted_tasks.append(task)
-    tasks[:] = sorted_tasks
+    _reset_orientation(orientation)
+    tasks[:] = orientation + sorted_tasks
     return warnings
 
 
 def _legacy_sort(tasks: list[dict], points: list[dict]) -> None:
     """空图降级：精确复刻旧的 (day, mastery[kp], -weight) 排序 + 全局重编 order。"""
+    orientation, rest = split_orientation(tasks)
     order_by_point = {
         str(point.get("id", "")): _as_int(point.get("mastery"), 0)
         for point in points
         if isinstance(point, dict)
     }
-    tasks.sort(
+    rest.sort(
         key=lambda task: (
             _as_int(task.get("day"), 9),
             order_by_point.get(str(task.get("knowledgePointId")), 100),
             -_as_int(task.get("weight"), 0),
         )
     )
-    for index, task in enumerate(tasks, start=1):
+    for index, task in enumerate(rest, start=1):
         task["order"] = index
+    _reset_orientation(orientation)
+    tasks[:] = orientation + rest
 
 
 def reprioritize_pending(
@@ -404,14 +467,17 @@ def reprioritize_pending(
     kp_order = topological_rank(points, modules)
     done = kp_completion_map(tasks, points)
 
+    # 导引任务不参与重排（无知识点，否则会落入 unassigned 被挪到最后一天）。
+    orientation, tasks_no_orientation = split_orientation(tasks)
+
     frozen = [
         task
-        for task in tasks
+        for task in tasks_no_orientation
         if isinstance(task, dict) and str(task.get("status")) in FROZEN_STATUSES
     ]
     pending = [
         task
-        for task in tasks
+        for task in tasks_no_orientation
         if isinstance(task, dict) and str(task.get("status")) not in FROZEN_STATUSES
     ]
 
@@ -535,7 +601,8 @@ def reprioritize_pending(
             task["order"] = order_index
             order_index += 1
             sorted_tasks.append(task)
-    tasks[:] = sorted_tasks
+    _reset_orientation(orientation)
+    tasks[:] = orientation + sorted_tasks
     return warnings
 
 
@@ -680,13 +747,17 @@ def enforce_dag_order(
             f"任务「{str(task.get('title') or task.get('id'))}」已顺延至第 {target_day} 天：需先完成【{'、'.join(violation['prerequisiteNames'])}】"
         )
 
-    tasks.sort(
+    # 导引任务不参与排序重编（否则会被编成 order=1 而非置顶的 0）。
+    orientation, rest = split_orientation(tasks)
+    rest.sort(
         key=lambda task: (
             _as_int(task.get("day"), 9),
             1 if str(task.get("id")) in moved_ids else 0,
             _as_int(task.get("order"), 9999),
         )
     )
-    for index, task in enumerate(tasks, start=1):
+    for index, task in enumerate(rest, start=1):
         task["order"] = index
-    return tasks, warnings
+    _reset_orientation(orientation)
+    result = orientation + rest
+    return result, warnings

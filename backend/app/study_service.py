@@ -3635,7 +3635,7 @@ def _approve_strategy_documents_legacy(
   "mockQuestions":[{"id":"英文短横线 id","type":"single","questionType":"单项选择题","score":5-15,"prompt":"...","options":["...","...","...","..."],"answerIndex":0-3,"explanation":"...","knowledgePointId":"...","source":"..."},{"id":"英文短横线 id","type":"calculation","questionType":"计算题","score":10-30,"prompt":"完整计算题题干","referenceAnswer":"参考答案和关键计算过程","gradingRubric":["评分点"],"explanation":"详细解析","knowledgePointId":"...","source":"..."}]
 }
 规则：任务覆盖用户填写的复习天数和每日时间；练习偏向摸底错误知识点；模拟卷必须先仿照上传资料中的模拟卷/样卷/真题结构，没有样卷时再按用户填写的考试形式和备注编排题型、题量与分值比例，例如“选择30分计算题70分”就按 30/70 组织；计算题、综合题、简答题必须返回 type="calculation" 且包含 referenceAnswer 和 gradingRubric，不能压成选择题；任务内容必须服从已确认复习计划。source 字段仅作为内部元数据，标题、描述、讲义、例题、自测解析等用户可见内容不要写“来源、出处、资料依据、参考”。
-modules 代表课程的几大知识模块（通常 4-8 个），必须基于你对课程内容的理解按学科主题划分（如「力学」「电磁学」「资金时间价值」「图论」）；上传资料仅作学习素材，严禁把资料文件名或资料自带的章节划分直接搬进 modules，也不得把每个知识点各列一章。跨章节的综合复习/答题模板类内容并入最贴近的主题模块。每个 knowledgePoint 必须通过 moduleId 归到且仅归到一个 module，moduleId 必须命中 modules 中已声明的某个 id。
+modules 代表课程的几大知识模块（通常 4-8 个），必须按这门课在教科书/教学大纲中的标准章节主题划分（如操作系统 → 内存管理/进程管理/文件系统管理/输入输出设备管理；物理学 → 力学/热学/电磁学/光学）：每个标准章节独立成模块，模块内再拆小节知识点；不要把「基础概念」「综合应用」这类学习阶段当模块，也不要把多个标准章节拼成混合模块（如「I/O 与文件系统」应拆成「文件系统管理」「输入输出设备管理」两章）；模块顺序遵循教材标准讲授主线，「跨章节综合/冲刺」类内容可保留为最末一个模块；用户指定过模块划分或顺序时以用户为准。上传资料仅作学习素材，严禁把资料文件名或资料自带的章节划分直接搬进 modules，也不得把每个知识点各列一章。每个 knowledgePoint 必须通过 moduleId 归到且仅归到一个 module，moduleId 必须命中 modules 中已声明的某个 id。
 knowledgePoints 的 difficulty 表示学习难度（1 最简单、5 最难，依据资料的抽象程度和计算复杂度判断）；prerequisites 只填真实存在的学习先后依赖（如先「资金时间价值」后「方案比选」），无依赖就不要填；tasks 的 day 与 order 仍按每日时间预算正常编排，系统会基于依赖关系统一重排复习顺序。
 """
     try:
@@ -3779,6 +3779,13 @@ def ensure_orientation_task(course_id: str, *, force: bool = False) -> dict[str,
         assessment_profile=workspace.get("assessmentProfile", {}),
     )
     orientation_task = _make_orientation_task(course_id, guide)
+    if existing:
+        # 强制重建只换导引内容；已读/完成状态沿用旧任务，避免主线重排后把
+        # 用户已完成的导引打回未读（progress 统计会随之回退）。
+        previous = existing[0]
+        for key in ("status", "progress", "completedAt"):
+            if previous.get(key) is not None:
+                orientation_task[key] = previous[key]
     workspace["tasks"] = [orientation_task] + [t for t in tasks if not study_scheduler.is_orientation(t)]
     save_workspace(workspace, course_id)
     return workspace
@@ -3831,15 +3838,42 @@ def maintain_review_plan(course_id: str, event: str) -> None:
         "event": event,
         "course": workspace.get("course", {}),
         "onboarding": workspace.get("onboarding", {}),
-        "diagnostic": workspace.get("diagnostic", {}),
+        "modules": workspace.get("modules", []),
         "knowledgePoints": workspace.get("knowledgePoints", []),
-        "tasks": workspace.get("tasks", []),
-        "wrongAnswers": workspace.get("wrongAnswers", []),
+        # tasks 全量序列化可达 ~2MB（studyGuide 全文），上游网关对超大请求体
+        # 直接回 HTTP 502 且重试无济于事——只送调度相关字段，压缩到 KB 级。
+        "tasks": [
+            {
+                key: task.get(key)
+                for key in (
+                    "id",
+                    "day",
+                    "order",
+                    "title",
+                    "status",
+                    "duration",
+                    "priority",
+                    "knowledgePointId",
+                )
+            }
+            for task in workspace.get("tasks", [])
+            if isinstance(task, dict)
+        ],
+        "wrongAnswers": [
+            {
+                key: answer.get(key)
+                for key in ("question", "userAnswer", "correctAnswer", "knowledgePointId", "wrongCount")
+                if answer.get(key) is not None
+            }
+            for answer in workspace.get("wrongAnswers", [])
+            if isinstance(answer, dict)
+        ],
         "materialMemory": workspace.get("materialMemory", {}),
         "note": workspace.get("note", ""),
     }
     task_prompt = """
 你负责维护课程的“速通复习总计划”文档。根据最新学习状态和本次事件，更新计划，使其忠实反映已完成任务、当前薄弱点、剩余时间和下一阶段策略。
+若输入的 modules/任务排布显示复习主线已重排（模块顺序或组成变化），必须让计划中的“复习主线”与新的模块顺序完全一致，旧主线表述全部改写。
 只更新复习计划，不修改课程总 Prompt，也不要声称修改了后端任务。保留既有 Markdown 章节结构，但把“资料依据/来源/出处/参考”类展示改写为复习重点、安排思路或直接删除。
 只返回 JSON：{"reviewPlanMarkdown":"完整新版 Markdown","changeSummary":"一句话变更摘要"}
 """
@@ -4308,7 +4342,7 @@ def bootstrap_engineering_workspace(force: bool = False) -> dict[str, Any]:
 每个任务的 studyGuide 是“速成讲解正文”，不能只写提纲；至少包含 4 个目标、4 个概念讲解、1 道完整例题和 4 条考前检查。讲解质量要接近课件：写出定义、适用条件、公式口径、易错点和考试判别步骤；用户可见内容不要展示来源、出处、资料依据或参考。
 模拟卷必须按完整考试感组织：优先仿照资料中的模拟卷/样卷/真题结构；没有样卷时再按资料和考试说明动态编排题型、题量和分值比例。选择题返回 type="single"、options 和 answerIndex；计算题/综合题返回 type="calculation"、referenceAnswer 和 gradingRubric，题干要要求写出计算过程、公式代入和最终答案，不能压成选择题。
 每题必须可由所给资料判断，解释必须清楚给出关键公式或结论。真题题型优先覆盖资金时间价值、税后现金流、回收期、NPV/IRR/NAV、多方案、盈亏平衡和 Excel 口径。
-modules 给出课程的几大知识模块（如「资金时间价值」「现金流与评价指标」「多方案经济评价」「不确定性分析」），必须基于对课程内容的理解按学科主题划分；上传资料仅作学习素材，严禁照搬资料文件名或资料自带的章节划分，也不得把每个知识点各列一章；每个 knowledgePoint 必须通过 moduleId 归到且仅归到一个 module，moduleId 必须命中 modules 中已声明的某个 id。
+modules 给出课程的几大知识模块（如「资金时间价值」「现金流与评价指标」「多方案经济评价」「不确定性分析」），必须按这门课在教科书/教学大纲中的标准章节主题划分：每个标准章节独立成模块，模块内再拆小节知识点；不要把「基础概念」「综合应用」这类学习阶段当模块，也不要把多个标准章节拼成混合模块；模块顺序遵循教材标准讲授主线，「跨章节综合/冲刺」类内容可保留为最末一个模块。上传资料仅作学习素材，严禁照搬资料文件名或资料自带的章节划分，也不得把每个知识点各列一章；每个 knowledgePoint 必须通过 moduleId 归到且仅归到一个 module，moduleId 必须命中 modules 中已声明的某个 id。
 knowledgePoints 的 difficulty 表示学习难度（1 最简单、5 最难，依据资料的抽象程度和计算复杂度判断）；prerequisites 只填真实存在的学习先后依赖（如先「资金时间价值」后「方案比选」），无依赖就不要填；tasks 的 day 与 order 仍按每日预算正常编排，系统会基于依赖关系统一重排复习顺序。
 """
     try:
@@ -4653,8 +4687,10 @@ def _llm_regroup_modules(points: list[dict[str, Any]]) -> tuple[list[dict[str, A
     catalog = "\n".join(catalog_lines)
     task_prompt = """
 你是课程知识结构分析助手。把给定的知识点按学科语义归并成 4-8 个「模块/章节」，要求：
+- 模块划分采用学科标准章节架构：按这门课在教科书/教学大纲中的标准章节主题划分（如操作系统 → 内存管理/进程管理/文件系统管理/输入输出设备管理），每个标准章节独立成模块，模块内保留其小节知识点。
+- 不要把「基础概念」「综合应用」这类学习阶段当模块，也不要把多个标准章节拼成混合模块（如「I/O 与文件系统」应拆开）；「跨章节综合/冲刺」类内容可保留为最末一个模块。
 - 模块名必须贴合课程语境（如「力学」「电磁学」「资金时间价值」「图论」），不得使用「模块1/板块A」这类空泛占位名。
-- 同一主题的知识点归到同一模块；跨章节的综合复习、答题技巧、试卷说明类内容并入最贴近的主题模块，不单独成章。
+- 同一主题的知识点归到同一模块；模块顺序遵循教材标准讲授主线。
 - 每个知识点必须归到且仅归到一个模块；moduleId 必须命中 modules 中已声明的某个 id。
 只返回 JSON：
 {"modules":[{"id":"mod-英文短横线 id","title":"模块名","order":1}],"assignments":[{"pointId":"知识点 id","moduleId":"对应模块 id"}]}

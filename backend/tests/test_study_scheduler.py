@@ -26,7 +26,7 @@ def kp(pid, name=None, *, weight=10, mastery=50, difficulty=3, prereqs=None, mod
     }
 
 
-def task(tid, kp_id, *, day=1, order=1, duration=60, status="pending", priority="medium"):
+def task(tid, kp_id, *, day=1, order=1, duration=60, status="pending", priority="medium", kind=None):
     return {
         "id": tid,
         "knowledgePointId": kp_id,
@@ -37,7 +37,30 @@ def task(tid, kp_id, *, day=1, order=1, duration=60, status="pending", priority=
         "status": status,
         "priority": priority,
         "weight": 10,
+        **({"kind": kind} if kind else {}),
     }
+
+
+def orientation_task(course_id="test-course"):
+    from app.agents.workflow import ORIENTATION_TASK_ID, _make_orientation_task
+
+    guide = {
+        "overview": "overview" * 40,
+        "phases": [
+            {"title": "基础", "dayRange": "第1-2天", "goal": "打基础", "focus": ["概念"]},
+            {"title": "冲刺", "dayRange": "第3-4天", "goal": "综合练习"},
+        ],
+        "dependencyLayers": [
+            {"level": 1, "title": "入口层", "knowledgePoints": ["基础概念"], "rationale": "无前置"},
+        ],
+        "method": ["先框架后细节", "每天自测", "错题当天归档"],
+        "milestones": [
+            {"day": 2, "title": "基础过关", "criteria": "自测正确率≥60%"},
+            {"day": 4, "title": "全真模拟", "criteria": "完成一套模拟卷"},
+        ],
+        "checklist": ["确认考试时间", "备好资料", "规划每日时段", "建立错题本"],
+    }
+    return _make_orientation_task(course_id, guide), ORIENTATION_TASK_ID
 
 
 # ---------- sanitize_dependencies ----------
@@ -295,6 +318,201 @@ def test_apply_operations_rejects_dag_violation():
         assert "前置依赖" in str(error)
 
 
+def test_apply_operations_tolerates_baseline_violation():
+    """存量违规不毒化后续提案：基线里 adv 本就排在 basic 前，合法移动应放行。"""
+    from app.agents.tools import apply_operations_to_copy
+
+    workspace = {
+        "knowledgePoints": [kp("basic"), kp("adv", prereqs=["basic"])],
+        "tasks": [
+            task("t-adv", "adv", day=1, order=1),    # 存量违规
+            task("t-basic", "basic", day=2, order=2),
+            task("t-other", "", day=2, order=3),
+        ],
+    }
+    # 移动无依赖任务不产生新违规 → 应成功（旧逻辑会因存量违规全量否决）。
+    result = apply_operations_to_copy(
+        workspace, [{"type": "move_task", "task_id": "t-other", "day": 3, "order": 1}]
+    )
+    other = next(t for t in result if t["id"] == "t-other")
+    assert other["day"] == 3
+
+
+def test_apply_operations_still_rejects_worsening_move():
+    """基线违规存在时，把事情变更糟（新增违规对）仍要拒绝。"""
+    from app.agents.tools import apply_operations_to_copy
+
+    workspace = {
+        "knowledgePoints": [
+            kp("basic"),
+            kp("adv", prereqs=["basic"]),
+            kp("adv2", prereqs=["basic"]),
+        ],
+        "tasks": [
+            task("t-adv", "adv", day=1, order=1),    # 存量违规：adv 在 basic 前
+            task("t-basic", "basic", day=2, order=2),
+            task("t-adv2", "adv2", day=2, order=3),  # 本无违规：在 basic 之后
+        ],
+    }
+    # 把 basic 挪到 adv2 之后 → 给 adv2 新造一个违规（存量 t-adv 的违规不变）。
+    operations = [{"type": "move_task", "task_id": "t-basic", "day": 3, "order": 1}]
+    try:
+        apply_operations_to_copy(workspace, operations)
+        raise AssertionError("应当抛出 ValueError")
+    except ValueError as error:
+        assert "前置依赖" in str(error)
+
+
+# ---------- restructure_modules：模块重组提案 ----------
+
+def _restructure_operation():
+    return {
+        "type": "restructure_modules",
+        "modules": [
+            {
+                "id": "m-mem",
+                "title": "内存管理",
+                "pointIds": ["virtual", "paging"],
+            },
+            {
+                "id": "m-proc",
+                "title": "进程管理",
+                "pointIds": ["syscall", "process"],
+            },
+        ],
+        "prerequisitesOverride": {"virtual": []},
+    }
+
+
+def _restructure_workspace():
+    # 主线换轴前的布局：进程模块在前（process 依赖 syscall），内存的 virtual 依赖 process。
+    return {
+        "modules": [
+            {"id": "m-proc", "title": "进程", "order": 1},
+            {"id": "m-mem", "title": "内存", "order": 2},
+        ],
+        "knowledgePoints": [
+            kp("syscall", "系统调用", module="m-proc"),
+            kp("process", "进程线程", prereqs=["syscall"], module="m-proc"),
+            kp("virtual", "虚拟地址", prereqs=["process"], module="m-mem"),
+            kp("paging", "分页", prereqs=["virtual"], module="m-mem"),
+        ],
+        "tasks": [
+            task("t-syscall", "syscall", day=1, order=1),
+            task("t-process", "process", day=1, order=2),
+            task("t-virtual", "virtual", day=2, order=3),
+            task("t-paging", "paging", day=2, order=4),
+        ],
+    }
+
+
+def test_restructure_modules_swaps_mainline():
+    """内存主线提前：内存块整体排在进程块前，且依赖 override 后无回边。"""
+    from app.agents.tools import apply_operations_to_copy, build_module_reconcile
+
+    workspace = _restructure_workspace()
+    result = apply_operations_to_copy(
+        workspace,
+        [_restructure_operation()],
+        reconcile=build_module_reconcile([1, 2], 240),
+    )
+    assert isinstance(result, dict) and "modules" in result
+    kp_order = {t["id"]: t["order"] for t in result["tasks"]}
+    # 内存块（virtual/paging）整体先于进程块（syscall/process）。
+    assert max(kp_order["t-virtual"], kp_order["t-paging"]) < min(
+        kp_order["t-syscall"], kp_order["t-process"]
+    )
+    # override 生效：virtual 不再依赖 process。
+    virtual = next(p for p in result["knowledgePoints"] if p["id"] == "virtual")
+    assert virtual["prerequisites"] == []
+    assert virtual["moduleId"] == "m-mem"
+    # 重排后无违规。
+    assert study_scheduler.find_dag_violations(result["tasks"], result["knowledgePoints"]) == []
+
+
+def test_restructure_modules_rejects_incomplete_coverage():
+    from app.agents.tools import apply_operations_to_copy, build_module_reconcile
+
+    workspace = _restructure_workspace()
+    operation = _restructure_operation()
+    operation["modules"] = operation["modules"][:1]  # 漏掉进程模块的知识点
+    try:
+        apply_operations_to_copy(
+            workspace, [operation], reconcile=build_module_reconcile([1, 2], 240)
+        )
+        raise AssertionError("应当抛出 ValueError")
+    except ValueError as error:
+        assert "覆盖全部知识点" in str(error)
+
+
+def test_restructure_modules_must_be_solo():
+    from app.agents.tools import apply_operations_to_copy, build_module_reconcile
+
+    workspace = _restructure_workspace()
+    operations = [
+        _restructure_operation(),
+        {"type": "change_priority", "task_id": "t-paging", "priority": "high"},
+    ]
+    try:
+        apply_operations_to_copy(
+            workspace, operations, reconcile=build_module_reconcile([1, 2], 240)
+        )
+        raise AssertionError("应当抛出 ValueError")
+    except ValueError as error:
+        assert "单独成案" in str(error)
+
+
+def test_restructure_modules_rejects_unknown_prereq_override():
+    from app.agents.tools import apply_operations_to_copy, build_module_reconcile
+
+    workspace = _restructure_workspace()
+    operation = _restructure_operation()
+    operation["prerequisitesOverride"] = {"paging": ["ghost-id"]}
+    try:
+        apply_operations_to_copy(
+            workspace, [operation], reconcile=build_module_reconcile([1, 2], 240)
+        )
+        raise AssertionError("应当抛出 ValueError")
+    except ValueError as error:
+        assert "未知前置" in str(error)
+
+
+# ---------- topological_rank 模块主线模式 ----------
+
+def test_topological_module_mainline_blocks_by_module_order():
+    """依赖兼容时按模块 order 分块：内存模块(1)整块先于进程模块(2)。"""
+    points = [
+        kp("virtual", "虚拟地址", module="m-mem"),
+        kp("paging", "分页", prereqs=["virtual"], module="m-mem"),
+        kp("syscall", "系统调用", module="m-proc"),
+        kp("process", "进程", prereqs=["syscall"], module="m-proc"),
+    ]
+    modules = [
+        {"id": "m-mem", "title": "内存", "order": 1},
+        {"id": "m-proc", "title": "进程", "order": 2},
+    ]
+    rank = study_scheduler.topological_rank(points, modules)
+    assert max(rank["virtual"], rank["paging"]) < min(rank["syscall"], rank["process"])
+
+
+def test_topological_falls_back_to_layering_on_back_edge():
+    """存在跨模块回边（进程→内存的依赖）时退回全局分层，不按模块分块。"""
+    points = [
+        kp("virtual", "虚拟地址", module="m-mem"),
+        # paging 依赖 process（模块2）→ 内存块内出现回边，主线模式不可用。
+        kp("paging", "分页", prereqs=["process"], module="m-mem"),
+        kp("syscall", "系统调用", module="m-proc"),
+        kp("process", "进程", prereqs=["syscall"], module="m-proc"),
+    ]
+    modules = [
+        {"id": "m-mem", "title": "内存", "order": 1},
+        {"id": "m-proc", "title": "进程", "order": 2},
+    ]
+    rank = study_scheduler.topological_rank(points, modules)
+    # 全局分层下 paging（层3）必然晚于 process（层2），但内存块不再整块在前。
+    assert rank["process"] < rank["paging"]
+
+
 # ---------- 集成：_sanitize_custom_workspace 走调度器 ----------
 
 def test_sanitize_custom_workspace_schedules_by_dag():
@@ -347,3 +565,129 @@ def test_sanitize_custom_workspace_empty_graph_keeps_legacy_remap():
     days = sorted({t["day"] for t in workspace["tasks"]})
     # reviewCount=2, days=4 → 复习日 [1, 4]（_review_session_days: j=1 → 1+3=4）。
     assert days == [1, 4]
+
+
+# ---------- 第0天·复习导引（orientation）豁免逻辑 ----------
+
+def test_orientation_pinned_and_budget_free_in_schedule():
+    orient, _ = orientation_task()
+    points = [kp("a"), kp("b")]
+    tasks = [
+        orient,
+        task("t1", "a", duration=60),
+        task("t2", "b", duration=70),
+    ]
+    # 若导引的 15 分钟计入预算，t1+t2+导引 = 145 > 120，t2 会被挤到第 2 天。
+    study_scheduler.schedule_tasks(tasks, points, session_days=[1], daily_minutes=120)
+    assert (orient["day"], orient["order"]) == (0, 0)
+    assert tasks[0] is orient
+    assert all(t["day"] == 1 for t in tasks if t is not orient)
+
+
+def test_orientation_survives_legacy_sort_and_reprioritize():
+    orient, _ = orientation_task()
+    points = [kp("a"), kp("b")]
+    tasks = [
+        task("t1", "a", day=1, order=1),
+        orient,
+        task("t2", "b", day=2, order=2),
+    ]
+    study_scheduler.reprioritize_pending(tasks, points, session_days=[1, 2], daily_minutes=120)
+    # 无 knowledgePointId 的导引不能被推进"最后一天兜底桶"，必须保持置顶。
+    assert tasks[0] is orient
+    assert (orient["day"], orient["order"]) == (0, 0)
+    assert sorted(t["order"] for t in tasks if t is not orient) == [1, 2]
+
+
+def test_orientation_survives_enforce_dag_order():
+    orient, _ = orientation_task()
+    points = [kp("basic"), kp("adv", prereqs=["basic"])]
+    tasks = [
+        orient,
+        task("t-adv", "adv", day=1, order=1),
+        task("t-basic", "basic", day=2, order=2),
+    ]
+    fixed, warnings = study_scheduler.enforce_dag_order(
+        tasks, points, session_days=[1, 2, 3], daily_minutes=120
+    )
+    first = fixed[0]
+    # 重编 order 时导引不能被编成 1 号，保持 day=0/order=0 置顶。
+    assert first is orient
+    assert (first["day"], first["order"]) == (0, 0)
+    rest_orders = sorted(t["order"] for t in fixed if t is not orient)
+    assert rest_orders == [1, 2]
+
+
+def test_orientation_excluded_from_overdue():
+    from datetime import date, timedelta
+
+    from app import study_service
+
+    orient, _ = orientation_task()
+    base = {
+        "course": {"id": "test-course"},
+        "planStartDate": (date.today() - timedelta(days=2)).isoformat(),
+        "tasks": [
+            orient,
+            task("t-old", "a", day=1, order=1),
+            task("t-far", "b", day=3, order=1),
+        ],
+    }
+    progress = study_service.build_daily_progress(base)
+    assert progress["todayDay"] == 3
+    # day=0 < todayDay 恒成立，但导引绝不进逾期列表。
+    assert all(item["id"] != orient["id"] for item in progress["overdue"])
+    assert any(item["id"] == "t-old" for item in progress["overdue"])
+
+
+def test_orientation_skipped_by_content_quality_guard():
+    from app import study_service
+
+    orient, _ = orientation_task()
+    orient["contentQualityWarning"] = "遗留警告"
+    workspace = {
+        "course": {"id": "test-course", "name": "测试课"},
+        "onboarding": {"status": "planned", "days": 4, "dailyHours": 2},
+        "knowledgePoints": [kp("a")],
+        "tasks": [orient, task("t1", "a", day=1, order=1)],
+        "materials": [],
+    }
+    study_service._ensure_workspace_content_quality(workspace)
+    # 导引无 examPoints/objectives 顶层字段，必须被跳过：清掉遗留警告且不注入 4 段式 sections。
+    assert "contentQualityWarning" not in orient
+    assert "sections" not in (orient.get("studyGuide") or {})
+
+
+def test_apply_operations_rejects_orientation_move():
+    from app.agents.tools import apply_operations_to_copy
+
+    orient, orient_id = orientation_task()
+    workspace = {
+        "knowledgePoints": [kp("a")],
+        "tasks": [orient, task("t1", "a", day=1, order=1)],
+    }
+    operations = [{"type": "move_task", "task_id": orient_id, "day": 3, "order": 1}]
+    try:
+        apply_operations_to_copy(workspace, operations)
+        raise AssertionError("应当抛出 ValueError")
+    except ValueError as error:
+        assert "导引" in str(error)
+
+
+def test_backup_orientation_guide_zero_issues():
+    from app.agents.workflow import _backup_orientation_guide, _orientation_guide_issues
+
+    course = {"id": "test-course", "name": "测试课", "examDate": "2099-01-01", "targetScore": 90}
+    onboarding = {"days": 6, "dailyHours": 2}
+    modules = [{"id": "m-1", "title": "模块一", "order": 1}]
+    points = [kp("a", "基础"), kp("b", "进阶", prereqs=["a"])]
+    tasks = [task(f"t{i}", pid, day=i, order=1) for i, pid in enumerate(["a", "b"], start=1)]
+    guide = _backup_orientation_guide(
+        course=course,
+        onboarding=onboarding,
+        modules=modules,
+        knowledge_points=points,
+        tasks=tasks,
+    )
+    # 兜底模板必须零 issue 通过自身校验（LLM 失败时功能仍可用）。
+    assert _orientation_guide_issues(guide, expected_days=6) == []

@@ -119,7 +119,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "propose_plan_change",
-            "description": "生成等待用户确认的学习计划或学习内容调整提案。该工具不会直接修改学习空间。",
+            "description": (
+                "生成等待用户确认的学习计划或学习内容调整提案。该工具不会直接修改学习空间。"
+                "任务级的移动/删除/时长/优先级/例题用对应操作组合提交；"
+                "当用户要求调整模块划分、模块顺序或复习主线（如“改成四大模块”“先复习内存再复习进程”）时，"
+                "必须改用单独一条 restructure_modules 操作：给出按复习先后排序的完整模块表（覆盖全部知识点），"
+                "并按新主线用 prerequisitesOverride 调整跨模块前置依赖。系统会按新主线确定性重排全部任务。"
+                "restructure_modules 必须单独成案，不与其他操作混排。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -139,6 +146,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                         "change_priority",
                                         "move_task",
                                         "add_worked_example",
+                                        "restructure_modules",
                                     ],
                                 },
                                 "task_id": {"type": "string"},
@@ -146,6 +154,28 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                 "priority": {"type": "string", "enum": ["high", "medium", "low"]},
                                 "day": {"type": "integer", "minimum": 1, "maximum": 30},
                                 "order": {"type": "integer", "minimum": 1, "maximum": 100},
+                                "modules": {
+                                    "type": "array",
+                                    "description": "restructure_modules 专用：新的模块主线（按复习先后排序），每个模块列出归属知识点 id。必须覆盖全部知识点且不重复。",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "title": {"type": "string"},
+                                            "pointIds": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        },
+                                        "required": ["id", "title", "pointIds"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                                "prerequisitesOverride": {
+                                    "type": "object",
+                                    "description": "restructure_modules 专用：知识点 id → 新的前置 id 列表。只覆盖列出的知识点，未列出的保持原依赖。禁止自指、未知 id 或成环。",
+                                    "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                                },
                                 "example": {
                                     "type": "object",
                                     "properties": {
@@ -177,7 +207,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                     "additionalProperties": False,
                                 },
                             },
-                            "required": ["type", "task_id"],
+                            "required": ["type"],
                             "additionalProperties": False,
                         },
                         "minItems": 1,
@@ -393,8 +423,63 @@ def _append_worked_example(task: dict[str, Any], example: dict[str, Any]) -> Non
         return
 
 
-def apply_operations_to_copy(workspace: dict[str, Any], operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_operations_to_copy(
+    workspace: dict[str, Any],
+    operations: list[dict[str, Any]],
+    *,
+    reconcile: Callable[[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """把提案操作应用到 workspace 副本，返回新 tasks。
+
+    reconcile(tasks, points, modules)：可选的"模块重组落地"钩子。restructure_modules
+    操作只改模块/依赖，任务顺序由 reconcile（确定性重排）统一接管；不提供时保持旧行为。
+
+    DAG 校验口径：只拒绝"相对调整前新增"的违规。存量计划可能本来就带违规
+    （历史版本调度或数据问题），若全量否决，这些存量违规会毒化之后所有提案，
+    Agent 将永远无法提交任何重排——只需保证提案不把事情变更糟即可。
+
+    返回值约定：普通操作返回新 tasks；restructure_modules 返回
+    {"tasks": [...], "modules": [...], "knowledgePoints": [...]}（调用方据此落 workspace）。
+    """
+    if reconcile is None:
+        # 未注入钩子时兜底为"不允许 restructure_modules"的旧签名行为。
+        if any(str(operation.get("type", "")) == "restructure_modules" for operation in operations):
+            raise ValueError("restructure_modules 操作需要调度器支持（reconcile 钩子缺失）")
+        return _apply_task_operations(workspace, operations)
+
+    restructure = next(
+        (item for item in operations if str(item.get("type", "")) == "restructure_modules"),
+        None,
+    )
+    if restructure is not None:
+        if len(operations) != 1:
+            raise ValueError("restructure_modules 必须单独成案，不能与其他操作混排")
+        new_modules = _sanitize_restructure_modules(restructure, workspace)
+        # 深拷贝知识点再改挂载/依赖，提案被拒绝时不污染原 workspace。
+        staged_points = copy.deepcopy(workspace.get("knowledgePoints", []))
+        _apply_prerequisites_override(staged_points, restructure, workspace)
+        _apply_module_restructure(staged_points, new_modules)
+        study_scheduler.sanitize_dependencies(staged_points)  # 断环/清洗由调度器统一把关
+        staged_tasks = reconcile(
+            copy.deepcopy(workspace.get("tasks", [])), staged_points, new_modules
+        )
+        _reject_new_dag_violations(
+            staged_tasks,
+            staged_points,
+            baseline_tasks=workspace.get("tasks", []),
+            baseline_points=workspace.get("knowledgePoints", []),
+        )
+        return {"tasks": staged_tasks, "modules": new_modules, "knowledgePoints": staged_points}
+
+    return _apply_task_operations(workspace, operations)
+
+
+def _apply_task_operations(
+    workspace: dict[str, Any], operations: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """旧路径：任务级操作（move/remove/priority/duration/example），不含模块重组。"""
     tasks = copy.deepcopy(workspace.get("tasks", []))
+    points = workspace.get("knowledgePoints", [])
     by_id = {str(task.get("id")): task for task in tasks if isinstance(task, dict)}
     should_reorder = False
     for operation in operations:
@@ -403,6 +488,9 @@ def apply_operations_to_copy(workspace: dict[str, Any], operations: list[dict[st
         task = by_id.get(task_id)
         if task is None:
             raise ValueError(f"计划中不存在任务：{task_id}")
+        if study_scheduler.is_orientation(task):
+            # 第0天·复习导引任务固定置顶，不接受任何 AI 提案调整。
+            raise ValueError("复习导引任务不可调整")
         if operation_type == "remove_task":
             tasks = [item for item in tasks if str(item.get("id")) != task_id]
             by_id.pop(task_id, None)
@@ -431,18 +519,150 @@ def apply_operations_to_copy(workspace: dict[str, Any], operations: list[dict[st
             raise ValueError(f"不支持的调整操作：{operation_type}")
     if should_reorder:
         tasks.sort(key=lambda item: (int(item.get("day", 99)), int(item.get("order", 999))))
-        dag_violations = study_scheduler.find_dag_violations(
-            tasks, workspace.get("knowledgePoints", [])
-        )
-        if dag_violations:
-            violation = dag_violations[0]
-            raise ValueError(
-                "调整违反前置依赖："
-                f"「{violation['taskTitle']}」需先完成【{'、'.join(violation['prerequisiteNames'])}】"
-            )
+        _reject_new_dag_violations(tasks, points, baseline_tasks=workspace.get("tasks", []), baseline_points=points)
         for index, task in enumerate(tasks, start=1):
             task["order"] = index
     return tasks
+
+
+def _dag_violation_keys(tasks: list[dict[str, Any]], points: list[dict[str, Any]]) -> set[tuple]:
+    """违规指纹集合：(taskId, 拼接后的前置名) —— 用于调整前后对比。"""
+    return {
+        (str(item["taskId"]), "、".join(item["prerequisiteNames"]))
+        for item in study_scheduler.find_dag_violations(tasks, points)
+    }
+
+
+def _reject_new_dag_violations(
+    tasks: list[dict[str, Any]],
+    points: list[dict[str, Any]],
+    *,
+    baseline_tasks: list[dict[str, Any]],
+    baseline_points: list[dict[str, Any]],
+) -> None:
+    """调整后存在"基线没有"的新增违规 → 抛错；存量违规放行（不把事情变更糟即可）。"""
+    baseline_keys = _dag_violation_keys(baseline_tasks, baseline_points)
+    for key in _dag_violation_keys(tasks, points) - baseline_keys:
+        raise ValueError(f"调整违反前置依赖：{key[0]} 需先完成【{key[1]}】")
+
+
+def _sanitize_restructure_modules(operation: dict[str, Any], workspace: dict[str, Any]) -> list[dict[str, Any]]:
+    """校验 restructure_modules 操作的模块表：id 唯一、order 1..N 连续、知识点挂载合法。"""
+    modules = operation.get("modules")
+    if not isinstance(modules, list) or not modules:
+        raise ValueError("restructure_modules 必须提供非空 modules 列表")
+    seen_ids: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for module in modules:
+        if not isinstance(module, dict):
+            raise ValueError("restructure_modules 模块格式无效")
+        module_id = _clean_text(module.get("id"), 120)
+        title = _clean_text(module.get("title"), 200)
+        if not module_id or not title:
+            raise ValueError("restructure_modules 模块缺少 id 或 title")
+        if module_id in seen_ids:
+            raise ValueError(f"restructure_modules 模块 id 重复：{module_id}")
+        seen_ids.add(module_id)
+        normalized.append(
+            {
+                "id": module_id,
+                "title": title,
+                "order": len(normalized) + 1,
+                "pointIds": _clean_string_list(module.get("pointIds"), limit=100, item_limit=120),
+            }
+        )
+    known_point_ids = {
+        str(point.get("id", ""))
+        for point in workspace.get("knowledgePoints", [])
+        if isinstance(point, dict)
+    }
+    assigned: set[str] = set()
+    for module in normalized:
+        for point_id in module["pointIds"]:
+            if point_id not in known_point_ids:
+                raise ValueError(f"restructure_modules 引用了未知知识点：{point_id}")
+            if point_id in assigned:
+                raise ValueError(f"restructure_modules 知识点被重复挂载：{point_id}")
+            assigned.add(point_id)
+    unassigned = known_point_ids - assigned
+    if unassigned:
+        names = ", ".join(sorted(unassigned)[:5])
+        raise ValueError(f"restructure_modules 必须覆盖全部知识点，遗漏：{names}")
+    return normalized
+
+
+def _apply_module_restructure(points: list[dict[str, Any]], modules: list[dict[str, Any]]) -> None:
+    """把新模块表落到知识点上：改 moduleId（模块表本身由调用方写入 workspace）。"""
+    for module in modules:
+        for point_id in module["pointIds"]:
+            point = next(
+                (item for item in points if str(item.get("id", "")) == point_id),
+                None,
+            )
+            if point is not None:
+                point["moduleId"] = module["id"]
+
+
+def _apply_prerequisites_override(
+    points: list[dict[str, Any]],
+    operation: dict[str, Any],
+    workspace: dict[str, Any],
+) -> None:
+    """应用 prerequisitesOverride：知识点 id → 新前置列表（只覆盖列出的，其余保持原依赖）。
+
+    校验：key 必须是已知知识点；值里的前置 id 必须已知、非自指；环交由
+    sanitize_dependencies 断边（调度器已有成熟逻辑），这里只拦明显错误。
+    """
+    override = operation.get("prerequisitesOverride")
+    if override is None:
+        return
+    if not isinstance(override, dict):
+        raise ValueError("prerequisitesOverride 必须是 {知识点id: [前置id]} 对象")
+    point_by_id = {
+        str(point.get("id", "")): point for point in points if isinstance(point, dict)
+    }
+    for point_id, prereq_ids in override.items():
+        if point_id not in point_by_id:
+            raise ValueError(f"prerequisitesOverride 引用了未知知识点：{point_id}")
+        if not isinstance(prereq_ids, list):
+            raise ValueError(f"prerequisitesOverride[{point_id}] 必须是前置 id 列表")
+        cleaned: list[str] = []
+        for item in prereq_ids:
+            prereq = str(item).strip()
+            if not prereq:
+                continue
+            if prereq == point_id:
+                raise ValueError(f"prerequisitesOverride[{point_id}] 不能包含自身")
+            if prereq not in point_by_id:
+                raise ValueError(f"prerequisitesOverride[{point_id}] 引用了未知前置：{prereq}")
+            if prereq not in cleaned:
+                cleaned.append(prereq)
+        point_by_id[point_id]["prerequisites"] = cleaned
+
+
+def build_module_reconcile(
+    session_days: list[int], daily_minutes: int
+) -> Callable[[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]], list[dict[str, Any]]]:
+    """构造 restructure_modules 的确定性重排钩子：全量任务按新主线重新装箱。
+
+    completed/in-progress 任务不冻结——模块重组意味着主线整体换轴，保留旧冻结位
+    只会让新主线立刻碎掉；已学内容的知识点 mastery 高，重排后自然靠后或保持可复习。
+    """
+    def reconcile(
+        tasks: list[dict[str, Any]],
+        points: list[dict[str, Any]],
+        modules: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        study_scheduler.schedule_tasks(
+            tasks,
+            points,
+            session_days=list(session_days) or [1],
+            daily_minutes=daily_minutes,
+            modules=modules,
+        )
+        return tasks
+
+    return reconcile
 
 
 def _normalize_practice_set_items(
@@ -620,7 +840,24 @@ def execute_agent_tool(
             raise ValueError("调整提案必须包含操作")
         operations = _prepare_operations(operations)
         before_tasks = copy.deepcopy(workspace.get("tasks", []))
-        after_tasks = apply_operations_to_copy(workspace, operations)
+        # restructure_modules 需要按课程参数重排，这里组装 reconcile 闭包。
+        onboarding_cfg = workspace.get("onboarding") or {}
+        try:
+            from ..study_service import _review_session_days  # 延迟 import，避免循环依赖
+            session_days = _review_session_days(
+                int(onboarding_cfg.get("days") or 0),
+                int(onboarding_cfg.get("reviewCount") or 0),
+            )
+        except Exception:
+            session_days = [1]
+        daily_minutes = round(float(onboarding_cfg.get("dailyHours") or 0) * 60) or 120
+        result = apply_operations_to_copy(
+            workspace,
+            operations,
+            reconcile=build_module_reconcile(session_days, daily_minutes),
+        )
+        is_restructure = isinstance(result, dict) and "modules" in result
+        after_tasks = result["tasks"] if is_restructure else result
         proposal = create_adjustment_proposal(
             course_id,
             base_revision=int(workspace.get("planRevision", 0)),
@@ -632,7 +869,12 @@ def execute_agent_tool(
             after=_task_summary(after_tasks),
             source_run_id=source_run_id,
         )
-        return {"proposal": proposal, "message": "提案已创建，等待用户确认；学习空间尚未修改。"}
+        message = (
+            "模块重组提案已创建（主线重排预览已生成），等待用户确认；学习空间尚未修改。"
+            if is_restructure
+            else "提案已创建，等待用户确认；学习空间尚未修改。"
+        )
+        return {"proposal": proposal, "message": message}
     if name == "generate_practice_set":
         if save_workspace is None:
             raise RuntimeError("该工具需要写入权限，但未提供 save_workspace")
@@ -721,7 +963,32 @@ def apply_proposal(
     # 导致提案的 baseRevision 很快过期、用户点「采纳」时永远命中此分支，
     # 卡片始终点不动也不消失。真正决定提案能否应用的，是它引用的任务是否仍存在——
     # 这由 apply_operations_to_copy 校验，任务缺失或参数非法时抛 ValueError（路由层映射为 409）。
-    workspace["tasks"] = apply_operations_to_copy(workspace, proposal["operations"])
+    onboarding_cfg = workspace.get("onboarding") or {}
+    try:
+        from ..study_service import _review_session_days  # 延迟 import，避免循环依赖
+        session_days = _review_session_days(
+            int(onboarding_cfg.get("days") or 0),
+            int(onboarding_cfg.get("reviewCount") or 0),
+        )
+    except Exception:
+        session_days = [1]
+    daily_minutes = round(float(onboarding_cfg.get("dailyHours") or 0) * 60) or 120
+    applied = apply_operations_to_copy(
+        workspace,
+        proposal["operations"],
+        reconcile=build_module_reconcile(session_days, daily_minutes),
+    )
+    if isinstance(applied, dict) and "modules" in applied:
+        # restructure_modules：模块表 + 知识点（含新依赖/挂载）+ 重排后的 tasks 一并落地。
+        workspace["tasks"] = applied["tasks"]
+        workspace["knowledgePoints"] = applied["knowledgePoints"]
+        workspace["modules"] = [
+            {"id": m["id"], "title": m["title"], "order": m["order"]}
+            for m in applied["modules"]
+        ]
+        workspace["schedulingWarnings"] = []
+    else:
+        workspace["tasks"] = applied
 
     # 若提案携带参数变更（replan 类提案），在落 tasks 的同时一并把参数写入 workspace。
     # SQLite courses 表的同步由 main.py 的 apply 路由负责，避免本层反向依赖 DB。
