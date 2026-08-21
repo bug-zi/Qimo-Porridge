@@ -2,6 +2,8 @@ import type {
   AdjustmentProposal,
   AgentJob,
   ArchiveItem,
+  BilibiliCredentialStatus,
+  BilibiliCredentialVerifyResult,
   Course,
   CourseMindMap,
   DailyProgress,
@@ -87,14 +89,27 @@ type CourseMindMapApiResponse = {
   mindMap: CourseMindMap | null
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBaseUrl}${path}`, {
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      ...init?.headers,
-    },
-    ...init,
-  })
+async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
+  const controller = timeoutMs ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  let response: Response
+  try {
+    response = await fetch(`${apiBaseUrl}${path}`, {
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        ...init?.headers,
+      },
+      ...init,
+      signal: controller ? controller.signal : init?.signal,
+    })
+  } catch (error) {
+    if (controller && controller.signal.aborted) {
+      throw new Error(`请求超时（${Math.round((timeoutMs ?? 0) / 1000)} 秒无响应），请稍后重试。`)
+    }
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 
   const body = await response.json().catch(() => ({}))
   if (!response.ok) {
@@ -703,6 +718,30 @@ export function saveMcpServer(payload: {
 
 export function discoverMcpServer(serverId: string) {
   return request<McpServer>(`/mcp/servers/${encodeURIComponent(serverId)}/discover`, { method: 'POST' })
+}
+
+export function getBilibiliCredentialStatus() {
+  return request<BilibiliCredentialStatus>('/mcp/bilibili/credentials')
+}
+
+export function verifyBilibiliCredentials() {
+  // 后端 MCP 子进程超时为 120s（npx 首次拉起较慢），前端 135s 兜底
+  return request<BilibiliCredentialVerifyResult>('/mcp/bilibili/credentials/verify', undefined, 135_000)
+}
+
+export function saveBilibiliCredentials(payload: { sessdata: string; biliJct: string; dedeuserid: string }) {
+  return request<BilibiliCredentialStatus>('/mcp/bilibili/credentials', {
+    method: 'PUT',
+    body: JSON.stringify({
+      sessdata: payload.sessdata,
+      bili_jct: payload.biliJct,
+      dedeuserid: payload.dedeuserid,
+    }),
+  })
+}
+
+export function clearBilibiliCredentials() {
+  return request<BilibiliCredentialStatus>('/mcp/bilibili/credentials', { method: 'DELETE' })
 }
 
 export function submitCourseExternalSource(courseId: string, payload: {

@@ -67,6 +67,18 @@ MCP_PRESETS = (
     },
 )
 
+# 每个 stdio MCP 服务启动时需要从后端 .env 注入的环境变量（值不落库、不回显）
+MCP_ENV_INJECTIONS: dict[str, list[str]] = {
+    "mcp-bilibili": ["BILIBILI_SESSDATA", "BILIBILI_BILI_JCT", "BILIBILI_DEDEUSERID"],
+    "mcp-firecrawl": ["FIRECRAWL_API_KEY"],
+    "mcp-xiaohongshu": ["XHS_COOKIE"],
+}
+BILIBILI_CREDENTIAL_FIELDS = {
+    "sessdata": ("BILIBILI_SESSDATA", 512),
+    "bili_jct": ("BILIBILI_BILI_JCT", 64),
+    "dedeuserid": ("BILIBILI_DEDEUSERID", 32),
+}
+
 
 def _read_backend_env_value(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -83,6 +95,28 @@ def _read_backend_env_value(name: str) -> str:
         if key.strip() == name:
             return raw_value.strip().strip('"').strip("'")
     return ""
+
+
+def _write_backend_env_values(updates: dict[str, str | None]) -> None:
+    """把若干变量写入后端 .env；值为 None 表示删除该行。保留原有注释与顺序。"""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    remaining = dict(updates)
+    rewritten: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in remaining:
+                value = remaining.pop(key)
+                if value is not None:
+                    rewritten.append(f"{key}={value}")
+                continue
+        rewritten.append(line)
+    for key, value in remaining.items():
+        if value is not None:
+            rewritten.append(f"{key}={value}")
+    env_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
 
 
 @contextmanager
@@ -341,16 +375,20 @@ class McpHttpClient:
 
 
 class McpStdioClient:
-    def __init__(self, command: str, args: list[str]) -> None:
+    def __init__(self, command: str, args: list[str], env_names: list[str] | None = None) -> None:
         executable = shutil.which(command)
         if not executable:
             raise RuntimeError(f"未找到 MCP 启动命令：{command}，请先安装 Node.js 18+")
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         environment = os.environ.copy()
-        if "tavily" in " ".join([command, *args]).lower() and not environment.get("TAVILY_API_KEY"):
-            tavily_api_key = _read_backend_env_value("TAVILY_API_KEY")
-            if tavily_api_key:
-                environment["TAVILY_API_KEY"] = tavily_api_key
+        injection_names = list(env_names or [])
+        if "tavily" in " ".join([command, *args]).lower():
+            injection_names.append("TAVILY_API_KEY")
+        for name in injection_names:
+            if not environment.get(name):
+                value = _read_backend_env_value(name)
+                if value:
+                    environment[name] = value
         self.process = subprocess.Popen(
             [executable, *args],
             stdin=subprocess.PIPE,
@@ -463,7 +501,7 @@ class McpStdioClient:
 
 def _create_mcp_client(server: dict[str, Any]) -> McpHttpClient | McpStdioClient:
     if server["transport"] == "stdio":
-        return McpStdioClient(server["command"], server["args"])
+        return McpStdioClient(server["command"], server["args"], MCP_ENV_INJECTIONS.get(server["id"], []))
     return McpHttpClient(server["endpoint"])
 
 
@@ -659,3 +697,76 @@ def extract_mcp_text(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if extracted_content:
             return extracted_content, metadata
     return content, structured if isinstance(structured, dict) else {}
+
+
+def get_bilibili_credential_status() -> dict[str, Any]:
+    """本地快速检查：只看凭据是否配置，不回显任何 Cookie 值、不访问网络。"""
+    values = {
+        field: _read_backend_env_value(env_name)
+        for field, (env_name, _) in BILIBILI_CREDENTIAL_FIELDS.items()
+    }
+    source = "app" if all(values.values()) else ""
+    if not source:
+        global_config = Path.home() / ".bilibili-mcp" / "config.json"
+        if global_config.exists():
+            try:
+                parsed = json.loads(global_config.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                parsed = None
+            if isinstance(parsed, dict) and all(parsed.get(key) for key in ("sessdata", "bili_jct", "dedeuserid")):
+                source = "global_config"
+    return {"configured": bool(source == "app"), "source": source or "none"}
+
+
+def save_bilibili_credentials(sessdata: str, bili_jct: str, dedeuserid: str) -> dict[str, Any]:
+    normalized = {"sessdata": sessdata.strip(), "bili_jct": bili_jct.strip(), "dedeuserid": dedeuserid.strip()}
+    if not all(normalized.values()):
+        raise ValueError("SESSDATA、bili_jct、DedeUserID 三个字段都不能为空")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", normalized["bili_jct"]):
+        raise ValueError("bili_jct 格式无效：应为 32 位十六进制字符串（CSRF token）")
+    if not normalized["dedeuserid"].isdigit():
+        raise ValueError("DedeUserID 格式无效：应为纯数字（你的 B 站 UID）")
+    for field, (_, max_length) in BILIBILI_CREDENTIAL_FIELDS.items():
+        if len(normalized[field]) > max_length:
+            raise ValueError(f"{field} 长度超过上限 {max_length} 字符，请确认复制的是完整 Cookie 值")
+    _write_backend_env_values(
+        {env_name: normalized[field] for field, (env_name, _) in BILIBILI_CREDENTIAL_FIELDS.items()}
+    )
+    return get_bilibili_credential_status()
+
+
+def clear_bilibili_credentials() -> dict[str, Any]:
+    _write_backend_env_values({env_name: None for env_name, _ in BILIBILI_CREDENTIAL_FIELDS.values()})
+    return get_bilibili_credential_status()
+
+
+def verify_bilibili_credentials() -> dict[str, Any]:
+    """调用 bilibili-mcp 自带的 check_bilibili_credentials 工具做真实登录校验（会启动 npx 子进程）。"""
+    server = get_mcp_server("mcp-bilibili")
+    client = McpStdioClient(server["command"], server["args"], MCP_ENV_INJECTIONS.get(server["id"], []))
+    try:
+        result = client.call_tool("check_bilibili_credentials", {})
+    finally:
+        client.close()
+    text, _ = extract_mcp_text(result)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        logged_in = parsed.get("logged_in")
+        if logged_in is None:
+            logged_in = parsed.get("loggedIn")
+        if logged_in is None:
+            logged_in = parsed.get("logged")
+        steps = parsed.get("next_steps_zh") or parsed.get("next_steps") or []
+        message = str(parsed.get("message_zh") or parsed.get("message") or "")
+        if not message:
+            # bilibili-mcp 的 check 工具只返回状态字段，不含 message；合成友好提示
+            message = "B 站登录有效，凭据可用。" if logged_in else "登录无效：Cookie 已过期或未登录，请从浏览器重新获取。"
+        return {
+            "loggedIn": bool(logged_in) if logged_in is not None else None,
+            "message": message,
+            "nextSteps": [str(step) for step in steps] if isinstance(steps, list) else [],
+        }
+    return {"loggedIn": None, "message": text, "nextSteps": []}

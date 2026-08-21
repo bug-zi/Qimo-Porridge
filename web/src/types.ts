@@ -206,6 +206,17 @@ export type McpServer = {
   allowedTools: string[]
 }
 
+export type BilibiliCredentialStatus = {
+  configured: boolean
+  source: 'app' | 'global_config' | 'none'
+}
+
+export type BilibiliCredentialVerifyResult = {
+  loggedIn: boolean | null
+  message: string
+  nextSteps: string[]
+}
+
 export type ExternalSource = {
   id: string
   courseId: string

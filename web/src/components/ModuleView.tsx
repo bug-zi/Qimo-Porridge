@@ -4,6 +4,7 @@ import 'katex/dist/katex.min.css'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { glossaryMarkdownComponents, wrapTextWithTerms } from '../glossary/termMatcher'
+import { BilibiliCredentialDialog } from './BilibiliCredentialDialog'
 import {
   ArrowRight,
   ArchiveRestore,
@@ -27,6 +28,7 @@ import {
   FolderOpen,
   Gauge,
   GraduationCap,
+  KeyRound,
   Lightbulb,
   Link2,
   ListChecks,
@@ -49,6 +51,7 @@ import type {
   AdjustmentProposal,
   AgentJob,
   ArchiveItem,
+  BilibiliCredentialStatus,
   Course,
   CourseOnboarding,
   DailyProgress,
@@ -78,6 +81,7 @@ import type {
 import {
   approveCourseExternalSource,
   dismissCourseExternalSource,
+  getBilibiliCredentialStatus,
   getCourseExternalSource,
   getCourseMaterialConvertedFileUrl,
   getCourseMaterialFileUrl,
@@ -4650,6 +4654,15 @@ function materialPreviewLabel(material: Material) {
   return material.previewLabel ?? '需预览'
 }
 
+function isCredentialError(error: string | undefined) {
+  if (!error) return false
+  const normalized = error.toLowerCase()
+  return normalized.includes('凭据已过期或未登录')
+    || normalized.includes('凭据未配置')
+    || normalized.includes('credentials')
+    || normalized.includes('cookie')
+}
+
 function MaterialsView({
   course,
   materials,
@@ -4697,6 +4710,30 @@ function MaterialsView({
   }>({ url: '', serverId: '', toolName: '', sourceType: 'web' })
   const [externalSource, setExternalSource] = useState<ExternalSource | null>(null)
   const [isExternalSourceBusy, setIsExternalSourceBusy] = useState(false)
+  // 凭据类错误：保存失败的导入草稿，用户更新凭据后可一键重试
+  const [credentialRetry, setCredentialRetry] = useState<{
+    url: string
+    serverId: string
+    toolName: string
+    sourceType: ExternalSource['sourceType']
+  } | null>(null)
+  const [isCredentialDialogOpen, setIsCredentialDialogOpen] = useState(false)
+  const [bilibiliStatus, setBilibiliStatus] = useState<BilibiliCredentialStatus | null>(null)
+
+  useEffect(() => {
+    if (!isCredentialDialogOpen) return
+    void getBilibiliCredentialStatus()
+      .then((status) => setBilibiliStatus(status))
+      .catch(() => setBilibiliStatus(null))
+  }, [isCredentialDialogOpen])
+
+  function handleCredentialDialogClose() {
+    setIsCredentialDialogOpen(false)
+    // 凭据保存成功（状态变为 configured）才自动重试刚才失败的导入
+    if (credentialRetry && bilibiliStatus?.configured) {
+      retryExternalSource()
+    }
+  }
   const selectedMaterialUrl = selectedMaterial ? getCourseMaterialFileUrl(course.id, selectedMaterial.relativePath) : ''
   const selectedPreviewUrl = selectedMaterial && materialPreview?.isConvertedPreview
     ? getCourseMaterialConvertedFileUrl(course.id, selectedMaterial.relativePath)
@@ -4964,6 +5001,18 @@ function MaterialsView({
     }
   }
 
+  function retryExternalSource() {
+    if (!credentialRetry) return
+    setSourceDraft({ ...credentialRetry, url: credentialRetry.url })
+    setCredentialRetry(null)
+    setRescanError('')
+    // 等 state 落地后复用同一表单提交路径
+    window.setTimeout(() => {
+      const form = document.querySelector<HTMLFormElement>('.external-source-import')
+      form?.requestSubmit()
+    }, 0)
+  }
+
   async function approveExternalSource() {
     if (!externalSource) return
     setIsExternalSourceBusy(true)
@@ -5089,6 +5138,27 @@ function MaterialsView({
             </span>
           </header>
           {externalSource.error && <p role="alert">{externalSource.error}</p>}
+          {externalSource.status === 'failed' && isCredentialError(externalSource.error) && (
+            <div className="external-source-credential-hint">
+              <CircleAlert size={15} />
+              <span>B 站登录态已失效，更新 Cookie 后可重新解析这条链接。</span>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => {
+                  setCredentialRetry({
+                    url: externalSource.url,
+                    serverId: sourceDraft.serverId,
+                    toolName: sourceDraft.toolName,
+                    sourceType: externalSource.sourceType,
+                  })
+                  setIsCredentialDialogOpen(true)
+                }}
+              >
+                <KeyRound size={15} /> 去更新凭据
+              </button>
+            </div>
+          )}
           {externalSource.status === 'pending_review' && <pre>{externalSource.content.slice(0, 4000)}</pre>}
           {['pending_review', 'failed'].includes(externalSource.status) && (
             <footer>
@@ -5103,6 +5173,15 @@ function MaterialsView({
             </footer>
           )}
         </section>
+      )}
+      {isCredentialDialogOpen && (
+        <BilibiliCredentialDialog
+          status={bilibiliStatus}
+          onClose={handleCredentialDialogClose}
+          onSaved={() => {
+            void getBilibiliCredentialStatus().then(setBilibiliStatus).catch(() => setBilibiliStatus(null))
+          }}
+        />
       )}
       <section className="material-insight">
         <div className="material-insight-icon"><Sparkles size={20} /></div>

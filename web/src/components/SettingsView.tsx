@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import {
   discoverMcpServer,
+  getBilibiliCredentialStatus,
   getEmbeddingProfile,
   getKnowledgeBaseStatus,
   getUserProfilePrompt,
@@ -32,7 +33,9 @@ import {
   toRuntimeModelProfile,
   isDemoMode,
 } from '../apiClient'
+import { BilibiliCredentialDialog } from './BilibiliCredentialDialog'
 import type {
+  BilibiliCredentialStatus,
   EmbeddingProfile,
   KnowledgeBaseStatus,
   McpServer,
@@ -68,6 +71,7 @@ type ConnectionResult = {
   message: string
   available_models?: string[]
 }
+
 
 const providerPresets: ProviderPreset[] = [
   {
@@ -265,6 +269,8 @@ export function SettingsView({
   })
   const [mcpAction, setMcpAction] = useState<'idle' | 'saving' | 'discovering'>('idle')
   const [mcpMessage, setMcpMessage] = useState('')
+  const [bilibiliStatus, setBilibiliStatus] = useState<BilibiliCredentialStatus | null>(null)
+  const [isBilibiliDialogOpen, setIsBilibiliDialogOpen] = useState(false)
   const [userProfilePrompt, setUserProfilePrompt] = useState('')
   const [userProfileUpdatedAt, setUserProfileUpdatedAt] = useState('')
   const [userProfileAction, setUserProfileAction] = useState<'idle' | 'loading' | 'saving'>('loading')
@@ -312,6 +318,17 @@ export function SettingsView({
     return () => {
       isCancelled = true
     }
+  }, [])
+
+  function refreshBilibiliStatus() {
+    if (isDemoMode) return
+    void getBilibiliCredentialStatus()
+      .then((status) => setBilibiliStatus(status))
+      .catch(() => setBilibiliStatus(null))
+  }
+
+  useEffect(() => {
+    refreshBilibiliStatus()
   }, [])
 
   useEffect(() => {
@@ -872,6 +889,23 @@ export function SettingsView({
                 <h2>MCP 服务</h2>
                 <p>配置外部资料解析服务和允许调用的工具。</p>
               </div>
+              {!isDemoMode && (
+                <button
+                  className={`bilibili-credential-badge ${
+                    bilibiliStatus?.configured ? 'is-ok' : bilibiliStatus?.source === 'global_config' ? 'is-warn' : 'is-bad'
+                  }`}
+                  type="button"
+                  onClick={() => setIsBilibiliDialogOpen(true)}
+                >
+                  {bilibiliStatus?.configured
+                    ? <><CheckCircle2 size={14} /> B站已配置</>
+                    : bilibiliStatus?.source === 'global_config'
+                      ? <><CircleAlert size={14} /> B站凭据待更新</>
+                      : bilibiliStatus
+                        ? <><CircleAlert size={14} /> B站未配置</>
+                        : <><CircleAlert size={14} /> B站状态未知</>}
+                </button>
+              )}
             </header>
             <div className="model-form-grid knowledge-form-grid">
               <label className="settings-field">
@@ -1073,6 +1107,13 @@ export function SettingsView({
           </section>
         </aside>
       </div>
+      {isBilibiliDialogOpen && (
+        <BilibiliCredentialDialog
+          status={bilibiliStatus}
+          onClose={() => setIsBilibiliDialogOpen(false)}
+          onSaved={refreshBilibiliStatus}
+        />
+      )}
     </div>
   )
 }

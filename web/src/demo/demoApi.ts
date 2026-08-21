@@ -1111,6 +1111,22 @@ const demoApi: ApiSurface = {
     return server
   },
 
+  async getBilibiliCredentialStatus() {
+    return { configured: false, source: 'none' as const }
+  },
+
+  async verifyBilibiliCredentials() {
+    return { loggedIn: null, message: '演示模式不支持真实凭据校验。', nextSteps: [] }
+  },
+
+  async saveBilibiliCredentials() {
+    return { configured: true, source: 'app' as const }
+  },
+
+  async clearBilibiliCredentials() {
+    return { configured: false, source: 'none' as const }
+  },
+
   async submitCourseExternalSource(courseId, payload) {
     await loadSnapshot()
     const source: ExternalSource = {
