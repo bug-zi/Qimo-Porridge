@@ -1,4 +1,4 @@
-import { type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
+import { type CSSProperties, type FormEvent, memo, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Bot, Check, LoaderCircle, MessageCircle, PanelRightClose, PanelRightOpen, Send, Sparkles, X } from 'lucide-react'
 import rehypeKatex from 'rehype-katex'
@@ -26,6 +26,10 @@ type AiCompanionProps = {
 }
 
 type CompanionMode = 'chat' | 'agent'
+
+// 插件数组提为模块级常量：数组身份稳定，避免每次渲染都触发 ReactMarkdown 全量重解析
+const remarkPlugins = [remarkGfm, remarkMath]
+const rehypePlugins = [rehypeKatex]
 
 const agentPrompts = [
   '检查今天的复习计划',
@@ -107,6 +111,70 @@ function renderToolEvents(events: StreamingToolEvent[]) {
   )
 }
 
+type StreamingChatMessageProps = {
+  content: string
+  toolEvents: StreamingToolEvent[]
+  createdAt: string
+  isAgentMode: boolean
+}
+
+/** 流式回复条目：独立 memo，token 增量只重渲染这一条，历史消息不受牵连。 */
+const StreamingChatMessage = memo(function StreamingChatMessage({
+  content,
+  toolEvents,
+  createdAt,
+  isAgentMode,
+}: StreamingChatMessageProps) {
+  const streamingPlaceholder = isAgentMode ? 'Agent 正在思考…' : '正在组织回答…'
+  return (
+    <article className="chat-message is-pending is-streaming">
+      {renderToolEvents(toolEvents)}
+      <div className="chat-markdown">
+        {content ? (
+          <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={glossaryMarkdownComponents()}>
+            {formatAssistantContent(content)}
+          </ReactMarkdown>
+        ) : (
+          <p className="chat-streaming-placeholder">{streamingPlaceholder}</p>
+        )}
+        <span className="chat-cursor" aria-hidden="true">▍</span>
+      </div>
+      <time>{createdAt}</time>
+    </article>
+  )
+})
+
+type ChatMessageItemProps = {
+  message: StudyMessage
+  registerTurnRef: (id: string, node: HTMLElement | null) => void
+}
+
+/** 历史消息条目：memo 隔离，输入框打字 / 流式增量不再触发全部历史消息的 Markdown 重解析。 */
+const ChatMessageItem = memo(function ChatMessageItem({ message, registerTurnRef }: ChatMessageItemProps) {
+  return (
+    <article
+      className={`chat-message ${message.role === 'user' ? 'is-user' : ''} ${message.id === 'local-thinking' ? 'is-pending' : ''}`}
+      ref={
+        message.role === 'user'
+          ? (node) => registerTurnRef(message.id, node)
+          : undefined
+      }
+    >
+      {message.role === 'assistant' && renderToolEvents(message.toolEvents ?? [])}
+      {message.role === 'assistant' ? (
+        <div className="chat-markdown">
+          <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={glossaryMarkdownComponents()}>
+            {formatAssistantContent(message.content)}
+          </ReactMarkdown>
+        </div>
+      ) : (
+        <p>{message.content}</p>
+      )}
+      <time>{message.createdAt}</time>
+    </article>
+  )
+})
+
 export function AiCompanion({
   className = '',
   course,
@@ -137,6 +205,8 @@ export function AiCompanion({
   const panelClassName = ['ai-panel', isCollapsed ? 'is-collapsed' : '', className].filter(Boolean).join(' ')
   const modeMessages = messages.filter((message) => (message.mode ?? 'chat') === mode)
   const thinkingText = mode === 'agent' ? 'Agent 已收到指令，正在拆解下一步行动...' : '我已收到，正在思考...'
+  // 流式占位消息的时间戳取自本地上屏的用户消息
+  const placeholderCreatedAt = pendingMessage?.createdAt ?? formatLocalTime()
   const placeholder: StudyMessage | null = pendingMessage
     ? streamingMessage
       ? {
@@ -263,60 +333,25 @@ export function AiCompanion({
     void sendMessage()
   }
 
-  function renderStreaming(sm: StreamingMessage, createdAt: string) {
-    const streamingPlaceholder = mode === 'agent' ? 'Agent 正在思考…' : '正在组织回答…'
-    return (
-      <article className="chat-message is-pending is-streaming" key="streaming">
-        {renderToolEvents(sm.toolEvents)}
-        <div className="chat-markdown">
-          {sm.content ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={glossaryMarkdownComponents()}>
-              {formatAssistantContent(sm.content)}
-            </ReactMarkdown>
-          ) : (
-            <p className="chat-streaming-placeholder">{streamingPlaceholder}</p>
-          )}
-          <span className="chat-cursor" aria-hidden="true">▍</span>
-        </div>
-        <time>{createdAt}</time>
-      </article>
-    )
-  }
+  // 稳定回调：避免 memo 的 ChatMessageItem 因内联箭头函数身份变化而失效
+  const registerTurnRef = useCallback((id: string, node: HTMLElement | null) => {
+    if (node) turnRefs.current.set(id, node)
+    else turnRefs.current.delete(id)
+  }, [])
 
   function renderMessage(message: StudyMessage) {
     if (message.id === 'streaming' && streamingMessage) {
-      return renderStreaming(streamingMessage, message.createdAt)
+      return (
+        <StreamingChatMessage
+          key="streaming"
+          content={streamingMessage.content}
+          toolEvents={streamingMessage.toolEvents}
+          createdAt={placeholderCreatedAt}
+          isAgentMode={mode === 'agent'}
+        />
+      )
     }
-    return (
-      <article
-        className={`chat-message ${message.role === 'user' ? 'is-user' : ''} ${message.id === 'local-thinking' ? 'is-pending' : ''}`}
-        key={message.id}
-        ref={
-          message.role === 'user'
-            ? (node) => {
-                if (node) turnRefs.current.set(message.id, node)
-                else turnRefs.current.delete(message.id)
-              }
-            : undefined
-        }
-      >
-        {message.role === 'assistant' && renderToolEvents(message.toolEvents ?? [])}
-        {message.role === 'assistant' ? (
-          <div className="chat-markdown">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkMath]}
-              rehypePlugins={[rehypeKatex]}
-              components={glossaryMarkdownComponents()}
-            >
-              {formatAssistantContent(message.content)}
-            </ReactMarkdown>
-          </div>
-        ) : (
-          <p>{message.content}</p>
-        )}
-        <time>{message.createdAt}</time>
-      </article>
-    )
+    return <ChatMessageItem key={message.id} message={message} registerTurnRef={registerTurnRef} />
   }
 
   return (

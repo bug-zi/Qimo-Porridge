@@ -443,6 +443,31 @@ function App() {
   const [activeStudyTaskId, setActiveStudyTaskId] = useState<string | null>(null)
   const [streamingMessage, setStreamingMessage] = useState<StreamingMessage | null>(null)
   const streamHandleRef = useRef<AgentStreamHandle | null>(null)
+  // token 到达往往远快于帧率：先攒进缓冲，rAF 时一次性合入 state，把流式重渲染压到每帧至多一次
+  const tokenBufferRef = useRef('')
+  const tokenFlushRef = useRef<number | null>(null)
+
+  const flushStreamingTokens = useCallback(() => {
+    tokenFlushRef.current = null
+    const chunk = tokenBufferRef.current
+    if (!chunk) return
+    tokenBufferRef.current = ''
+    setStreamingMessage((current) => (current ? { ...current, content: current.content + chunk } : current))
+  }, [])
+
+  const scheduleStreamingFlush = useCallback(() => {
+    if (tokenFlushRef.current !== null) return
+    tokenFlushRef.current = requestAnimationFrame(flushStreamingTokens)
+  }, [flushStreamingTokens])
+
+  /** 丢弃未刷新的缓冲 token：新流开始 / 流结束时调用，防止上一轮残留串扰下一轮。 */
+  const cancelStreamingFlush = useCallback(() => {
+    if (tokenFlushRef.current !== null) {
+      cancelAnimationFrame(tokenFlushRef.current)
+      tokenFlushRef.current = null
+    }
+    tokenBufferRef.current = ''
+  }, [])
   const [theme, setTheme] = useState<'light' | 'dark'>('light')
   const [uiFont, setUiFont] = useState<UiFont>(readInitialUiFont)
   const [uiFontSize, setUiFontSize] = useState<UiFontSize>(readInitialUiFontSize)
@@ -1172,6 +1197,7 @@ function App() {
       : undefined
 
     streamHandleRef.current?.cancel()
+    cancelStreamingFlush()
     setStreamingMessage({ content: '', toolEvents: [] })
 
     try {
@@ -1181,10 +1207,10 @@ function App() {
           message,
           mode,
           {
-            onToken: (text) =>
-              setStreamingMessage((current) =>
-                current ? { ...current, content: current.content + text } : current,
-              ),
+            onToken: (text) => {
+              tokenBufferRef.current += text
+              scheduleStreamingFlush()
+            },
             onToolStart: (event) =>
               setStreamingMessage((current) =>
                 current
@@ -1213,6 +1239,7 @@ function App() {
                   : current,
               ),
             onDone: (result) => {
+              cancelStreamingFlush()
               setStreamingMessage(null)
               updateActiveWorkspace(() => ({
                 ...result.workspace,
@@ -1222,6 +1249,7 @@ function App() {
               resolve()
             },
             onError: (errorMessage) => {
+              cancelStreamingFlush()
               // 流式不可用（上游不支持 stream / 网络中断）→ 自动降级到非流式，保证用户拿到回复
               askCourseAgent(workspaceSnapshot.course.id, message, mode, context)
                 .then((fallback) => {
@@ -1242,6 +1270,7 @@ function App() {
         )
       })
     } catch (error) {
+      cancelStreamingFlush()
       setStreamingMessage(null)
       throw error
     }

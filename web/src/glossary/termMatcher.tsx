@@ -133,13 +133,22 @@ export function wrapMarkdownChildren(children: ReactNode, keyPrefix = 'md'): Rea
   return children
 }
 
-/** ReactMarkdown components 覆写：p/li/td 三类正文容器接入术语包裹。 */
-export function glossaryMarkdownComponents() {
-  const wrap = (tag: string) => {
-    function GlossaryContainer(props: { children?: ReactNode }) {
-      return createElement(tag, props, wrapMarkdownChildren(props.children ?? null, `glossary-${tag}`))
-    }
-    return GlossaryContainer
+function wrapContainerTag(tag: string) {
+  function GlossaryContainer(props: { children?: ReactNode }) {
+    return createElement(tag, props, wrapMarkdownChildren(props.children ?? null, `glossary-${tag}`))
   }
-  return { p: wrap('p'), li: wrap('li'), td: wrap('td') }
+  return GlossaryContainer
+}
+
+/** ReactMarkdown components 覆写：p/li/td 三类正文容器接入术语包裹。
+ *  缓存为模块级单例：组件身份稳定，下游 ReactMarkdown 重渲染时不会因 components 变化整树重挂载。
+ *  术语匹配在渲染时动态读取模块级 matcher，缓存不影响词条更新后的重新包裹。 */
+const cachedGlossaryComponents = {
+  p: wrapContainerTag('p'),
+  li: wrapContainerTag('li'),
+  td: wrapContainerTag('td'),
+}
+
+export function glossaryMarkdownComponents() {
+  return cachedGlossaryComponents
 }
