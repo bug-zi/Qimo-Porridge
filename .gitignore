@@ -46,3 +46,7 @@ Thumbs.db
 
 # ===== Agent / tooling caches =====
 .agents/
+
+# ===== Local scratch (dev notes, one-off scripts) =====
+tmp/
+notes/
